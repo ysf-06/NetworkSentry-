@@ -1,0 +1,21 @@
+{
+  "database": {
+    "path": "networksentry.db",
+    "wal_mode": true
+  },
+  "network": {
+    "preferred_interface": null,
+    "scan_interval_seconds": 30,
+    "arp_timeout_ms": 1500,
+    "common_ports": [21, 22, 23, 53, 80, 135, 139, 443, 445, 3389, 8080, 8443]
+  },
+  "security": {
+    "lock_gateway_mac": true,
+    "alert_on_new_device": true,
+    "auto_port_scan_new_devices": true
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "networksentry.log"
+  }
+}
