@@ -71,15 +71,17 @@ NS_EXPORT int parse_arp_packet(
     uint16_t ethertype = read_be16(raw_bytes + 12);
     size_t arp_offset = ETH_HEADER_LEN;
 
-    /* Handle optional IEEE 802.1Q VLAN tag */
-    if (ethertype == ETHERTYPE_VLAN) {
-        if (length < MIN_ARP_FRAME_LEN + VLAN_HEADER_LEN) {
+    /* Handle up to 2 IEEE 802.1Q / 802.1ad (QinQ) VLAN tags */
+    int vlan_tags = 0;
+    while ((ethertype == ETHERTYPE_VLAN || ethertype == ETHERTYPE_QINQ) && vlan_tags < 2) {
+        if (length < arp_offset + VLAN_HEADER_LEN + ARP_IPV4_HEADER_LEN) {
             return -2;
         }
-        uint16_t tci = read_be16(raw_bytes + 14);
+        uint16_t tci = read_be16(raw_bytes + arp_offset);
         out_pkt->vlan_id = (int)(tci & 0x0FFF);
-        ethertype = read_be16(raw_bytes + 16);
+        ethertype = read_be16(raw_bytes + arp_offset + 2);
         arp_offset += VLAN_HEADER_LEN;
+        vlan_tags++;
     }
 
     if (ethertype != ETHERTYPE_ARP) {
@@ -96,7 +98,8 @@ NS_EXPORT int parse_arp_packet(
     if (htype != ARP_HTYPE_ETHERNET ||
         ptype != ARP_PTYPE_IPV4 ||
         hlen != ARP_HLEN_ETHERNET ||
-        plen != ARP_PLEN_IPV4) {
+        plen != ARP_PLEN_IPV4 ||
+        (opcode != ARP_OP_REQUEST && opcode != ARP_OP_REPLY)) {
         return -4;
     }
 
@@ -143,12 +146,14 @@ NS_EXPORT int parse_ipv4_packet(
     uint16_t ethertype = read_be16(raw_bytes + 12);
     size_t ip_offset = ETH_HEADER_LEN;
 
-    if (ethertype == ETHERTYPE_VLAN) {
-        if (length < ETH_HEADER_LEN + VLAN_HEADER_LEN + 20) {
+    int vlan_tags = 0;
+    while ((ethertype == ETHERTYPE_VLAN || ethertype == ETHERTYPE_QINQ) && vlan_tags < 2) {
+        if (length < ip_offset + VLAN_HEADER_LEN + 20) {
             return -2;
         }
-        ethertype = read_be16(raw_bytes + 16);
+        ethertype = read_be16(raw_bytes + ip_offset + 2);
         ip_offset += VLAN_HEADER_LEN;
+        vlan_tags++;
     }
 
     if (ethertype != ETHERTYPE_IPV4) {
@@ -158,8 +163,9 @@ NS_EXPORT int parse_ipv4_packet(
     const uint8_t *ip = raw_bytes + ip_offset;
     uint8_t version = (ip[0] >> 4) & 0x0F;
     uint8_t ihl = (ip[0] & 0x0F) * 4;
+    uint16_t total_len = read_be16(ip + 2);
 
-    if (version != 4 || ihl < 20 || length < ip_offset + ihl) {
+    if (version != 4 || ihl < 20 || length < ip_offset + ihl || total_len < ihl) {
         return -4;
     }
 
@@ -168,7 +174,7 @@ NS_EXPORT int parse_ipv4_packet(
     format_ipv4_fast(ip + 12, out_pkt->src_ip);
     format_ipv4_fast(ip + 16, out_pkt->dst_ip);
 
-    out_pkt->total_length = (int)read_be16(ip + 2);
+    out_pkt->total_length = (int)total_len;
     out_pkt->ttl = (int)ip[8];
     out_pkt->protocol = (int)ip[9];
 

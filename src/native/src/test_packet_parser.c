@@ -76,6 +76,52 @@ static void test_malformed_and_truncated_packets(void) {
     non_arp[12] = 0x08;
     non_arp[13] = 0x00;
     assert(parse_arp_packet(non_arp, 42, &pkt) == -3);
+
+    /* Invalid ARP opcode (0 and 99) */
+    uint8_t bad_op[42];
+    const uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33};
+    const uint8_t ip[4]  = {192, 168, 1, 1};
+    build_arp_frame(mac, mac, 0, mac, ip, mac, ip, bad_op, sizeof(bad_op));
+    assert(parse_arp_packet(bad_op, 42, &pkt) == -4);
+
+    /* QinQ double-tagged VLAN ARP frame (0x88A8 outer S-Tag 200 + 0x8100 inner C-Tag 42) */
+    uint8_t base_arp[42];
+    uint8_t qinq_arp[50];
+    build_arp_frame(mac, mac, ARP_OP_REPLY, mac, ip, mac, ip, base_arp, sizeof(base_arp));
+    memcpy(qinq_arp, base_arp, 12);
+    qinq_arp[12] = 0x88; qinq_arp[13] = 0xA8; qinq_arp[14] = 0x00; qinq_arp[15] = 200;
+    qinq_arp[16] = 0x81; qinq_arp[17] = 0x00; qinq_arp[18] = 0x00; qinq_arp[19] = 42;
+    memcpy(qinq_arp + 20, base_arp + 12, 30);
+    assert(parse_arp_packet(qinq_arp, 50, &pkt) == 0);
+    assert(pkt.vlan_id == 42);
+    assert(pkt.opcode == 2);
+
+    /* IPv4 with IHL = 6 (24-byte header with options) and boundary TCP port extraction */
+    uint8_t ipv4_opt[42] = {0};
+    ParsedIpPacket ip_pkt;
+    memcpy(ipv4_opt + 0, mac, 6);
+    memcpy(ipv4_opt + 6, mac, 6);
+    ipv4_opt[12] = 0x08; ipv4_opt[13] = 0x00; /* IPv4 */
+    ipv4_opt[14] = 0x46; /* Version 4, IHL = 6 (24 bytes) */
+    ipv4_opt[16] = 0x00; ipv4_opt[17] = 28; /* total_length = 28 */
+    ipv4_opt[22] = 64;   /* TTL */
+    ipv4_opt[23] = 6;    /* TCP */
+    memcpy(ipv4_opt + 26, ip, 4);
+    memcpy(ipv4_opt + 30, ip, 4);
+    /* 4 bytes of IPv4 options at 34..37, then TCP ports at 38..41 */
+    ipv4_opt[38] = 0x1F; ipv4_opt[39] = 0x90; /* src_port = 8080 */
+    ipv4_opt[40] = 0x01; ipv4_opt[41] = 0xBB; /* dst_port = 443 */
+
+    /* Truncated before IHL finishes (37 bytes < 14 + 24) -> -4 */
+    assert(parse_ipv4_packet(ipv4_opt, 37, &ip_pkt) == -4);
+    /* Full 42 bytes -> parses options + TCP ports */
+    assert(parse_ipv4_packet(ipv4_opt, 42, &ip_pkt) == 0);
+    assert(ip_pkt.src_port == 8080);
+    assert(ip_pkt.dst_port == 443);
+
+    /* Bogus total_length < ihl -> -4 */
+    ipv4_opt[17] = 10;
+    assert(parse_ipv4_packet(ipv4_opt, 42, &ip_pkt) == -4);
 }
 
 int main(void) {

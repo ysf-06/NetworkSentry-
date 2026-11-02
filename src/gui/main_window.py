@@ -459,6 +459,7 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_scan_now.setEnabled(False)
+        self.combo_iface.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -490,6 +491,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_completed(self, result: DiscoveryResult, new_alerts: List[SecurityAlertRecord]) -> None:
         self.btn_scan_now.setEnabled(True)
+        self.combo_iface.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.refresh_all_views()
 
@@ -504,6 +506,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_failed(self, error_msg: str) -> None:
         self.btn_scan_now.setEnabled(True)
+        self.combo_iface.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage(f"Scan error: {error_msg}")
 
@@ -558,6 +561,8 @@ class MainWindow(QMainWindow):
             dst_ip=parsed.dst_ip,
             opcode=parsed.opcode,
             is_gratuitous=parsed.is_gratuitous,
+            eth_src_mac=parsed.eth_src_mac,
+            mac_mismatch=parsed.mac_mismatch,
             db=self.db,
         )
 
@@ -716,8 +721,20 @@ class MainWindow(QMainWindow):
         self.risk_engine.evaluate_device(dev, open_ports=ports, active_alerts=alerts, db=self.db)
         self.refresh_all_views()
 
+    def _recalculate_all_device_risks(self) -> None:
+        """Re-evaluate risk scores for all devices against remaining unresolved alerts."""
+        unresolved = self.db.get_alerts(unresolved_only=True)
+        for dev in self.db.get_all_devices(online_only=False):
+            ports = self.db.get_device_ports(dev.mac)
+            self.risk_engine.evaluate_device(
+                dev,
+                open_ports=ports,
+                active_alerts=unresolved,
+                db=self.db,
+            )
+
     def resolve_selected_alert(self) -> None:
-        """Mark the currently selected security alert as resolved."""
+        """Mark the currently selected security alert as resolved and update device risk scores."""
         row = self.alerts_table.currentRow()
         if row < 0:
             return
@@ -727,13 +744,25 @@ class MainWindow(QMainWindow):
         alert_id = id_item.data(Qt.ItemDataRole.UserRole)
         if alert_id is not None:
             self.db.resolve_alert(int(alert_id))
+            self._recalculate_all_device_risks()
             self.refresh_all_views()
 
     def resolve_all_alerts(self) -> None:
-        """Mark all unresolved security alerts as resolved."""
+        """Mark all unresolved security alerts as resolved and update device risk scores."""
         count = self.db.resolve_all_alerts()
+        self._recalculate_all_device_risks()
         self.refresh_all_views()
         self.status_bar.showMessage(f"Resolved {count} alert(s).")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Stop background timers, wait for active worker thread, and hide tray icon on exit."""
+        if hasattr(self, "scan_timer"):
+            self.scan_timer.stop()
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.wait(2500)
+        if hasattr(self, "tray_icon") and self.tray_icon is not None:
+            self.tray_icon.hide()
+        super().closeEvent(event)
 
     def export_csv_report(self, target_path: Optional[str | Path] = None) -> Optional[Path]:
         """Export current device inventory to a CSV file."""

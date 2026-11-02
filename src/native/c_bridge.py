@@ -325,7 +325,51 @@ class NativePacketEngine:
                 vlan_id=int(c_pkt.vlan_id),
                 is_valid=True,
             )
-        return None
+        # Fallback pure-Python parser when native shared library is unavailable
+        import struct
+
+        eth_dst = ":".join(f"{b:02X}" for b in raw_bytes[0:6])
+        eth_src = ":".join(f"{b:02X}" for b in raw_bytes[6:12])
+        ethertype = struct.unpack("!H", raw_bytes[12:14])[0]
+        offset = 14
+        vlan_id = -1
+        vlan_tags = 0
+        while ethertype in (0x8100, 0x88A8) and vlan_tags < 2:
+            if len(raw_bytes) < offset + 4 + 28:
+                return None
+            tci, ethertype = struct.unpack("!HH", raw_bytes[offset : offset + 4])
+            vlan_id = tci & 0x0FFF
+            offset += 4
+            vlan_tags += 1
+
+        if ethertype != 0x0806 or len(raw_bytes) < offset + 28:
+            return None
+
+        htype, ptype, hlen, plen, opcode = struct.unpack("!HHBBH", raw_bytes[offset : offset + 8])
+        if htype != 1 or ptype != 0x0800 or hlen != 6 or plen != 4 or opcode not in (1, 2):
+            return None
+
+        sha = raw_bytes[offset + 8 : offset + 14]
+        spa = raw_bytes[offset + 14 : offset + 18]
+        tha = raw_bytes[offset + 18 : offset + 24]
+        tpa = raw_bytes[offset + 24 : offset + 28]
+        src_mac = ":".join(f"{b:02X}" for b in sha)
+        dst_mac = ":".join(f"{b:02X}" for b in tha)
+        src_ip = socket.inet_ntoa(spa)
+        dst_ip = socket.inet_ntoa(tpa)
+        return ArpPacketInfo(
+            src_mac=src_mac,
+            dst_mac=dst_mac,
+            eth_src_mac=eth_src,
+            eth_dst_mac=eth_dst,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            opcode=opcode,
+            is_gratuitous=(spa == tpa),
+            mac_mismatch=(eth_src != src_mac),
+            vlan_id=vlan_id,
+            is_valid=True,
+        )
 
     def parse_ipv4_packet(self, raw_bytes: bytes) -> Optional[IpPacketInfo]:
         """Parse raw Ethernet + IPv4 frame bytes into `IpPacketInfo` via C struct."""
@@ -350,4 +394,49 @@ class NativePacketEngine:
                 total_length=int(c_pkt.total_length),
                 is_valid=True,
             )
-        return None
+
+        # Fallback pure-Python IPv4 parser
+        import struct
+
+        dst_mac = ":".join(f"{b:02X}" for b in raw_bytes[0:6])
+        src_mac = ":".join(f"{b:02X}" for b in raw_bytes[6:12])
+        ethertype = struct.unpack("!H", raw_bytes[12:14])[0]
+        offset = 14
+        vlan_tags = 0
+        while ethertype in (0x8100, 0x88A8) and vlan_tags < 2:
+            if len(raw_bytes) < offset + 4 + 20:
+                return None
+            _, ethertype = struct.unpack("!HH", raw_bytes[offset : offset + 4])
+            offset += 4
+            vlan_tags += 1
+
+        if ethertype != 0x0800 or len(raw_bytes) < offset + 20:
+            return None
+
+        ip_hdr = raw_bytes[offset:]
+        version = (ip_hdr[0] >> 4) & 0x0F
+        ihl = (ip_hdr[0] & 0x0F) * 4
+        total_len = struct.unpack("!H", ip_hdr[2:4])[0]
+        if version != 4 or ihl < 20 or len(raw_bytes) < offset + ihl or total_len < ihl:
+            return None
+
+        ttl = ip_hdr[8]
+        protocol = ip_hdr[9]
+        src_ip = socket.inet_ntoa(ip_hdr[12:16])
+        dst_ip = socket.inet_ntoa(ip_hdr[16:20])
+        src_port, dst_port = 0, 0
+        if protocol in (6, 17) and len(raw_bytes) >= offset + ihl + 4:
+            src_port, dst_port = struct.unpack("!HH", ip_hdr[ihl : ihl + 4])
+
+        return IpPacketInfo(
+            src_mac=src_mac,
+            dst_mac=dst_mac,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            protocol=protocol,
+            src_port=src_port,
+            dst_port=dst_port,
+            ttl=ttl,
+            total_length=total_len,
+            is_valid=True,
+        )

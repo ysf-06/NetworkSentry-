@@ -90,9 +90,25 @@ def test_arp_spoof_live_packet_inspection() -> None:
     assert spoof.alert_type == "ARP_SPOOFING"
     assert spoof.severity == "CRITICAL"
 
+    # L2/L3 MAC header mismatch: attacker forges gateway MAC in ARP payload but sends from DE:AD:BE:EF:99:99
+    mismatch_alert = detector.inspect_arp_packet(
+        src_mac="50:C7:BF:00:00:01",
+        src_ip="192.168.1.1",
+        dst_mac="FF:FF:FF:FF:FF:FF",
+        dst_ip="192.168.1.1",
+        opcode=2,
+        is_gratuitous=True,
+        eth_src_mac="DE:AD:BE:EF:99:99",
+        mac_mismatch=True,
+    )
+    assert mismatch_alert is not None
+    assert mismatch_alert.alert_type == "ARP_SPOOFING"
+    assert mismatch_alert.severity == "CRITICAL"
+    assert mismatch_alert.mac == "DE:AD:BE:EF:99:99"
+
 
 def test_port_scanner_with_local_tcp_listener(tmp_path: Path) -> None:
-    """Verify concurrent TCP port scanning and banner grabbing against a real local socket."""
+    """Verify concurrent TCP port scanning, banner grabbing, and pruning closed ports on rescan."""
     db = DatabaseManager(db_path=tmp_path / "ports.db")
     mac = "AA:BB:CC:11:22:33"
     db.upsert_device(DeviceRecord(mac=mac, ip="127.0.0.1"))
@@ -102,11 +118,13 @@ def test_port_scanner_with_local_tcp_listener(tmp_path: Path) -> None:
     server_sock.listen(2)
     open_port = server_sock.getsockname()[1]
 
-    # Pick a closed port
+    # Pick a closed port and seed it in DB as previously open to verify stale-port cleanup
     closed_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     closed_sock.bind(("127.0.0.1", 0))
     closed_port = closed_sock.getsockname()[1]
     closed_sock.close()
+    db.save_port_scan(PortScanRecord(mac=mac, ip="127.0.0.1", port=closed_port, service="telnet"))
+    assert len(db.get_device_ports(mac)) == 1
 
     def _serve_once() -> None:
         try:
@@ -130,6 +148,7 @@ def test_port_scanner_with_local_tcp_listener(tmp_path: Path) -> None:
     assert results[0].state == "OPEN"
     assert "SSH-2.0-NetworkSentryTest" in results[0].banner
 
+    # Previously open `closed_port` must be pruned from SQLite on rescan
     saved_ports = db.get_device_ports(mac)
     assert len(saved_ports) == 1
     assert saved_ports[0].port == open_port

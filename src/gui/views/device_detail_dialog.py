@@ -220,3 +220,9 @@ class DeviceDetailDialog(QDialog):
         self.lbl_scan_status.setText(f"Scan complete: {len(open_ports)} open TCP port(s) found.")
         self.refresh_data()
         self.device_updated.emit(self.device.mac)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Ensure background port scan worker completes cleanly before closing dialog."""
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.wait(2000)
+        super().closeEvent(event)

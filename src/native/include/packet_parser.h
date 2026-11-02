@@ -27,6 +27,7 @@ extern "C" {
 #define ETHERTYPE_IPV4      0x0800
 #define ETHERTYPE_ARP       0x0806
 #define ETHERTYPE_VLAN      0x8100
+#define ETHERTYPE_QINQ      0x88A8
 
 #define ARP_HTYPE_ETHERNET  1
 #define ARP_PTYPE_IPV4      0x0800

@@ -156,9 +156,13 @@ def test_main_window_table_filtering_trust_and_arp_attack_simulation(tmp_path: P
     assert csv_out is not None and csv_out.exists()
     assert json_out is not None and json_out.exists()
 
-    # Resolve all alerts
+    # Resolve all alerts and verify risk score recalculation
     win.resolve_all_alerts()
     assert len(db.get_alerts(unresolved_only=True)) == 0
+    attacker_after_resolve = db.get_device_by_mac("DE:AD:BE:EF:CA:FE")
+    assert attacker_after_resolve is not None
+    assert attacker_after_resolve.risk_level == "MEDIUM"
+    assert db.get_dashboard_stats()["high_risk_devices"] == 0
     win.close()
 
 

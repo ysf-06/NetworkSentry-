@@ -158,7 +158,10 @@ class PortScanner:
         open_records.sort(key=lambda r: r.port)
 
         if db is not None and mac and mac != "00:00:00:00:00:00":
-            for rec in open_records:
-                db.save_port_scan(rec)
+            db.sync_host_port_scans(
+                mac=mac,
+                scanned_ports=[int(p) for p in target_ports],
+                open_records=open_records,
+            )
 
         return open_records

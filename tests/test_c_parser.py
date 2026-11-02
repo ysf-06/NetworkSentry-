@@ -73,6 +73,14 @@ def test_c_arp_gratuitous_and_mac_mismatch_and_vlan() -> None:
     assert vlan_pkt.vlan_id == 100
     assert vlan_pkt.src_ip == "192.168.1.1"
 
+    # 3. Insert 802.1ad QinQ outer S-Tag (0x88A8, VLAN 200) + inner C-Tag (0x8100, VLAN 42)
+    qinq_tags = struct.pack("!HHHH", 0x88A8, 200, 0x8100, 42)
+    qinq_frame = spoof_frame[:12] + qinq_tags + spoof_frame[12:]
+    qinq_pkt = engine.parse_arp_packet(qinq_frame)
+    assert qinq_pkt is not None
+    assert qinq_pkt.vlan_id == 42
+    assert qinq_pkt.mac_mismatch is True
+
 
 def test_c_ipv4_tcp_packet_parsing_and_malformed_handling() -> None:
     """Verify IPv4 + TCP header parsing and rejection of truncated/corrupt frames."""
@@ -107,11 +115,31 @@ def test_c_ipv4_tcp_packet_parsing_and_malformed_handling() -> None:
     assert ip_pkt.src_port == 54321
     assert ip_pkt.dst_port == 443
 
+    # Verify pure-Python fallback when _lib is None
+    fallback_engine = NativePacketEngine(lib_path="nonexistent_library.dll", auto_compile=False)
+    assert fallback_engine.is_native_loaded is False
+    fb_ip = fallback_engine.parse_ipv4_packet(raw_ipv4)
+    assert fb_ip is not None
+    assert fb_ip.src_port == 54321 and fb_ip.dst_port == 443
+
     # Malformed / truncated frames must safely return None
     assert engine.parse_arp_packet(b"") is None
     assert engine.parse_arp_packet(b"\x00" * 15) is None
     assert engine.parse_arp_packet(raw_ipv4) is None  # IPv4 frame is not ARP
     assert engine.parse_ipv4_packet(b"\x00" * 20) is None
+
+    # Invalid ARP opcode (99) must be rejected
+    bad_arp = engine.build_arp_frame(
+        eth_dst="FF:FF:FF:FF:FF:FF",
+        eth_src="00:03:93:11:22:33",
+        opcode=99,
+        sender_mac="00:03:93:11:22:33",
+        sender_ip="192.168.1.42",
+        target_mac="00:00:00:00:00:00",
+        target_ip="192.168.1.1",
+    )
+    assert engine.parse_arp_packet(bad_arp) is None
+    assert fallback_engine.parse_arp_packet(bad_arp) is None
 
 
 def test_c_engine_integration_with_arp_spoof_detector() -> None:
@@ -139,6 +167,8 @@ def test_c_engine_integration_with_arp_spoof_detector() -> None:
         dst_ip=parsed.dst_ip,
         opcode=parsed.opcode,
         is_gratuitous=parsed.is_gratuitous,
+        eth_src_mac=parsed.eth_src_mac,
+        mac_mismatch=parsed.mac_mismatch,
     )
     assert alert is not None
     assert alert.alert_type == "ARP_SPOOFING"

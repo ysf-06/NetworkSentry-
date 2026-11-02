@@ -181,6 +181,8 @@ class ARPSpoofDetector:
         dst_ip: str,
         opcode: int,
         is_gratuitous: bool = False,
+        eth_src_mac: Optional[str] = None,
+        mac_mismatch: bool = False,
         db: Optional[DatabaseManager] = None,
     ) -> Optional[SecurityAlertRecord]:
         """
@@ -191,9 +193,31 @@ class ARPSpoofDetector:
         if not OUILookup.is_valid_mac(norm_src_mac):
             return None
 
+        norm_eth_src = OUILookup.normalize_mac(eth_src_mac) if eth_src_mac else ""
+        has_header_mismatch = bool(mac_mismatch) or (
+            bool(norm_eth_src) and OUILookup.is_valid_mac(norm_eth_src) and norm_eth_src != norm_src_mac
+        )
+
+        # 0. Ethernet frame source MAC != ARP Sender Hardware Address (L2/L3 header forgery)
+        if has_header_mismatch:
+            culprit_mac = norm_eth_src if OUILookup.is_valid_mac(norm_eth_src) else norm_src_mac
+            alert = SecurityAlertRecord(
+                alert_type="ARP_SPOOFING",
+                severity="CRITICAL",
+                mac=culprit_mac,
+                ip=src_ip,
+                description=(
+                    f"Live Packet Alert: Ethernet/ARP MAC Mismatch! Frame sent by physical MAC "
+                    f"{culprit_mac} but forged ARP Sender MAC {norm_src_mac} for IP {src_ip}."
+                ),
+            )
+            if db is not None:
+                alert.id = db.record_alert(alert)
+            return alert
+
         # 1. Gateway MAC spoofing check
         if self.gateway_ip and src_ip == self.gateway_ip:
-            if self.locked_gateway_mac is None:
+            if self.locked_gateway_mac is None or not self.lock_gateway_mac:
                 self.locked_gateway_mac = norm_src_mac
             elif norm_src_mac != self.locked_gateway_mac:
                 alert = SecurityAlertRecord(

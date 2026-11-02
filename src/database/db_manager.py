@@ -396,6 +396,52 @@ class DatabaseManager:
                 ),
             )
 
+    def sync_host_port_scans(
+        self,
+        mac: str,
+        scanned_ports: List[int],
+        open_records: List[PortScanRecord],
+        protocol: str = "TCP",
+    ) -> None:
+        """
+        Synchronize port scan results for a host by removing any previously open ports
+        within `scanned_ports` that are now closed, and upserting `open_records`.
+        """
+        norm_mac = mac.upper().strip()
+        open_port_set = {rec.port for rec in open_records}
+        closed_ports = [int(p) for p in scanned_ports if int(p) not in open_port_set]
+
+        with self._lock, self._get_connection() as conn:
+            if closed_ports:
+                placeholders = ",".join("?" for _ in closed_ports)
+                conn.execute(
+                    f"DELETE FROM port_scans WHERE mac = ? AND protocol = ? AND port IN ({placeholders})",
+                    [norm_mac, protocol, *closed_ports],
+                )
+            for record in open_records:
+                conn.execute(
+                    """
+                    INSERT INTO port_scans (mac, ip, port, protocol, service, banner, state, scanned_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(mac, port, protocol) DO UPDATE SET
+                        ip = excluded.ip,
+                        service = excluded.service,
+                        banner = excluded.banner,
+                        state = excluded.state,
+                        scanned_at = excluded.scanned_at
+                    """,
+                    (
+                        norm_mac,
+                        record.ip,
+                        record.port,
+                        record.protocol,
+                        record.service,
+                        record.banner,
+                        record.state,
+                        record.scanned_at,
+                    ),
+                )
+
     def get_device_ports(self, mac: str) -> List[PortScanRecord]:
         """Get all discovered open ports for a device."""
         norm_mac = mac.upper().strip()

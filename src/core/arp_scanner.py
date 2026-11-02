@@ -220,7 +220,6 @@ class ARPScanner:
             ip_to_macs.setdefault(interface.ip_address, set()).add(norm_local)
 
         # 2. Active concurrent ARP sweep
-        total = len(target_ips)
         completed = 0
 
         if target_ips:
@@ -230,6 +229,7 @@ class ARPScanner:
                     for ip in target_ips
                     if ip != interface.ip_address
                 }
+                total = len(future_to_ip)
                 for future in as_completed(future_to_ip):
                     ip = future_to_ip[future]
                     completed += 1
