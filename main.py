@@ -1,9 +1,44 @@
 """Network Sentry — Main Entry Point (PySide6 Desktop GUI & CLI Modes)."""
 
 import argparse
+import os
 import socket
 import sys
+from pathlib import Path
 from typing import Optional
+
+
+def _prepare_working_directory(config_path: str = "config.json") -> None:
+    """
+    Normalize the process working directory before logger or database setup so
+    standalone `.exe` launches from `WindowsApps`, `System32`, or arbitrary folders never fail.
+    """
+    from src.utils.logger import get_app_data_dir
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if not Path(config_path).is_absolute() and not Path(config_path).exists():
+            try:
+                os.chdir(exe_dir)
+            except OSError:
+                try:
+                    os.chdir(get_app_data_dir())
+                except OSError:
+                    pass
+    else:
+        cwd_str = str(Path.cwd()).lower()
+        if "windowsapps" in cwd_str or "system32" in cwd_str:
+            project_dir = Path(__file__).resolve().parent
+            try:
+                os.chdir(project_dir)
+            except OSError:
+                try:
+                    os.chdir(get_app_data_dir())
+                except OSError:
+                    pass
+
+
+_prepare_working_directory()
 
 from src.core.arp_scanner import ARPScanner
 from src.core.interface_detector import InterfaceDetector
@@ -14,13 +49,14 @@ from src.security.arp_spoof_detector import ARPSpoofDetector
 from src.security.port_scanner import PortScanner
 from src.security.risk_engine import RiskEngine
 from src.utils.config import ConfigManager
-from src.utils.logger import setup_logger
+from src.utils.logger import get_app_data_dir, setup_logger
 from src.utils.oui_lookup import OUILookup
 from src.utils.reporter import ReportExporter
 
 
 def run_diagnostics(config_path: str = "config.json") -> int:
     """Execute system diagnostics: Interface Detection, SQLite WAL DB, OUI DB, and Native C Engine."""
+    _prepare_working_directory(config_path)
     cfg = ConfigManager(config_path)
     logger = setup_logger(
         "NetworkSentry",
@@ -28,8 +64,9 @@ def run_diagnostics(config_path: str = "config.json") -> int:
     )
 
     print("=" * 74)
-    print("  NETWORK SENTRY v1.0.0 — System & Security Engine Diagnostics")
+    print("  NETWORK SENTRY v1.1.0 — System & Security Engine Diagnostics")
     print("=" * 74)
+    print(f"  App Data Dir : {get_app_data_dir()}")
 
     # 1. Detect Network Interfaces
     interfaces = InterfaceDetector.list_interfaces(include_loopback=False)
@@ -109,7 +146,9 @@ def run_cli_scan(
     export_json: Optional[str] = None,
 ) -> int:
     """Execute a full CLI network discovery & security scan."""
+    _prepare_working_directory(config_path)
     cfg = ConfigManager(config_path)
+    setup_logger("NetworkSentry", log_file=cfg.get("logging", "file", "networksentry.log"))
     db = DatabaseManager(
         db_path=cfg.get("database", "path", "networksentry.db"),
         wal_mode=bool(cfg.get("database", "wal_mode", True)),
@@ -166,16 +205,11 @@ def run_cli_scan(
 def run_gui(config_path: str = "config.json") -> int:
     """Launch the PySide6 Desktop Application."""
     import ctypes
-    import os
-    from pathlib import Path
     from PySide6.QtWidgets import QApplication
     from src.gui.main_window import MainWindow
     from src.gui.widgets.cyber_charts import create_cyber_guardian_icon
 
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        if not Path(config_path).is_absolute() and not Path(config_path).exists():
-            os.chdir(exe_dir)
+    _prepare_working_directory(config_path)
 
     if sys.platform == "win32":
         try:

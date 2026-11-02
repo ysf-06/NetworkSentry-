@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from src.utils.logger import get_app_data_dir, resolve_data_path
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "database": {
         "path": "networksentry.db",
@@ -28,10 +30,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 class ConfigManager:
-    """Loads, validates, and persists user configuration."""
+    """Loads, validates, and persists user configuration in a writable application directory."""
 
     def __init__(self, config_path: str | Path = "config.json") -> None:
-        self.config_path = Path(config_path)
+        raw_path = Path(config_path)
+        if raw_path.is_absolute() or raw_path.exists():
+            self.config_path = raw_path
+        else:
+            self.config_path = resolve_data_path(raw_path, seed_from_bundle=True)
         self.data: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict[str, Any]:
@@ -49,14 +55,37 @@ class ConfigManager:
         return merged
 
     def save(self) -> None:
-        """Persist current configuration to disk."""
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
-            json.dumps(self.data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        """Persist current configuration to disk (falling back to %LOCALAPPDATA%\\NetworkSentry if needed)."""
+        target = self.config_path
+        if not target.is_absolute():
+            target = resolve_data_path(target)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.config_path = target
+        except OSError:
+            fallback = get_app_data_dir() / target.name
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fallback.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.config_path = fallback
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
-        """Retrieve a specific setting by section and key."""
-        return self.data.get(section, {}).get(key, default)
+        """Retrieve a specific setting by section and key, resolving relative DB/log paths to AppData."""
+        val = self.data.get(section, {}).get(key, default)
+        if section == "database" and key == "path" and isinstance(val, (str, Path)):
+            p = Path(val)
+            if not p.is_absolute():
+                return str(resolve_data_path(p, seed_from_bundle=True))
+        if section == "logging" and key == "file" and isinstance(val, (str, Path)):
+            p = Path(val)
+            if not p.is_absolute():
+                return str(resolve_data_path(p, seed_from_bundle=False))
+        return val
+
 

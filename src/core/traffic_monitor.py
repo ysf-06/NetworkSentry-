@@ -12,6 +12,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import psutil
 
 from src.database.db_manager import DatabaseManager
+from src.native.c_bridge import NativePacketEngine
 from src.security.port_scanner import DEFAULT_SCAN_PORTS
 
 TCP_FLAG_SERIES: List[Tuple[str, str, str]] = [
@@ -44,6 +45,7 @@ class TrafficSample:
     gateway_mbps: float
     vendor_breakdown: Dict[str, float] = field(default_factory=dict)
     tcp_flags: Dict[str, float] = field(default_factory=dict)
+    is_estimated: bool = True
 
 
 @dataclass
@@ -63,20 +65,54 @@ class TelemetrySnapshot:
     samples: List[TrafficSample]
     spiral_intensities: List[float]
     active_nql: str = ""
+    is_estimated: bool = True
+    telemetry_mode: str = "ESTIMATED_NIC"
+    telemetry_label: str = "OS NIC Counters + Estimated Telemetry (Demo/Estimated without Live Pcap)"
 
 
 class TrafficMonitor:
-    """Collects live NIC packet/byte counters, socket flows, and database port metrics."""
+    """Collects live NIC packet/byte counters, active OS socket flows, C-engine packet captures, and DB port metrics."""
 
-    def __init__(self, max_samples: int = 60) -> None:
+    def __init__(
+        self,
+        max_samples: int = 60,
+        demo_mode: bool = False,
+        c_engine: Optional[NativePacketEngine] = None,
+    ) -> None:
         self.max_samples = max(20, max_samples)
+        self.demo_mode = bool(demo_mode)
+        self.c_engine = c_engine
         self._samples: Deque[TrafficSample] = deque(maxlen=self.max_samples)
         self._last_io_time: float = time.monotonic()
         self._last_bytes: int = 0
         self._last_packets: int = 0
         self._base_packets: int = 0
         self._tick: int = 0
+
+        # Accumulators for real raw packets ingested via NativePacketEngine
+        self._ingested_packets_total: int = 0
+        self._ingested_tcp_packets: int = 0
+        self._ingested_udp_packets: int = 0
+        self._ingested_icmp_packets: int = 0
+        self._ingested_arp_packets: int = 0
+        self._ingested_port_counts: Dict[int, int] = {}
+        self._last_os_tcp_flows: int = 0
+        self._last_os_udp_flows: int = 0
+        self._window_bytes: int = 0
+        self._window_tcp_bytes: int = 0
+        self._window_udp_bytes: int = 0
+        self._window_icmp_bytes: int = 0
+        self._window_packets: int = 0
+        self._window_ips: set[str] = set()
+        self._window_tcp_flags: Dict[str, float] = {}
+
         self._init_counters()
+        self._seed_initial_history()
+
+    def set_demo_mode(self, enabled: bool) -> None:
+        """Enable or disable synthetic demo waveform mode and reset baseline samples."""
+        self.demo_mode = bool(enabled)
+        self._samples.clear()
         self._seed_initial_history()
 
     def _init_counters(self) -> None:
@@ -88,15 +124,130 @@ class TrafficMonitor:
                 self._base_packets = self._last_packets
         except Exception:
             self._last_bytes = 0
-            self._last_packets = 1_200_000
-            self._base_packets = 1_200_000
+            self._last_packets = 0
+            self._base_packets = 0
         self._last_io_time = time.monotonic()
 
+    @staticmethod
+    def decode_tcp_flags_label(flags_mask: int) -> str:
+        """Map a 6-bit TCP header flags bitmask to its display series name."""
+        mask = int(flags_mask) & 0x3F
+        if mask == 0:
+            return "No flags set"
+        fin = bool(mask & 0x01)
+        syn = bool(mask & 0x02)
+        psh = bool(mask & 0x08)
+        ack = bool(mask & 0x10)
+        urg = bool(mask & 0x20)
+
+        if urg and psh and syn and fin:
+            return "URG PSH SYN FIN"
+        if ack and syn and fin:
+            return "ACK SYN FIN"
+        if ack and psh and syn:
+            return "ACK PSH SYN"
+        if ack and psh and fin:
+            return "ACK PSH FIN"
+        if syn and fin:
+            return "SYN FIN"
+        if ack and syn:
+            return "ACK SYN"
+        if ack and psh:
+            return "ACK PSH"
+        if ack and fin:
+            return "ACK FIN"
+        if syn:
+            return "SYN"
+        if ack:
+            return "ACK PSH"
+        if fin:
+            return "ACK FIN"
+        return "No flags set"
+
+    def ingest_raw_packet(self, raw_bytes: bytes) -> bool:
+        """
+        Parse and ingest a live raw Ethernet frame using the Native C Packet Engine.
+        Returns True if the frame was valid IPv4 or ARP and recorded in live capture counters.
+        """
+        if not raw_bytes:
+            return False
+        engine = self.c_engine or NativePacketEngine(auto_compile=False)
+        self.c_engine = engine
+
+        ip_pkt = engine.parse_ipv4_packet(raw_bytes)
+        if ip_pkt is not None and ip_pkt.is_valid:
+            pkt_len = max(len(raw_bytes), ip_pkt.total_length)
+            self._ingested_packets_total += 1
+            self._window_packets += 1
+            self._window_bytes += pkt_len
+            if ip_pkt.src_ip:
+                self._window_ips.add(ip_pkt.src_ip)
+            if ip_pkt.dst_ip:
+                self._window_ips.add(ip_pkt.dst_ip)
+            if ip_pkt.dst_port > 0:
+                self._ingested_port_counts[ip_pkt.dst_port] = (
+                    self._ingested_port_counts.get(ip_pkt.dst_port, 0) + 1
+                )
+            if ip_pkt.protocol == 6:
+                self._ingested_tcp_packets += 1
+                self._window_tcp_bytes += pkt_len
+                lbl = self.decode_tcp_flags_label(ip_pkt.tcp_flags)
+                self._window_tcp_flags[lbl] = self._window_tcp_flags.get(lbl, 0.0) + 1.0
+            elif ip_pkt.protocol == 17:
+                self._ingested_udp_packets += 1
+                self._window_udp_bytes += pkt_len
+            elif ip_pkt.protocol == 1:
+                self._ingested_icmp_packets += 1
+                self._window_icmp_bytes += pkt_len
+            return True
+
+        arp_pkt = engine.parse_arp_packet(raw_bytes)
+        if arp_pkt is not None and arp_pkt.is_valid:
+            self._ingested_packets_total += 1
+            self._ingested_arp_packets += 1
+            self._window_packets += 1
+            self._window_bytes += len(raw_bytes)
+            if arp_pkt.src_ip:
+                self._window_ips.add(arp_pkt.src_ip)
+            return True
+
+        return False
+
     def _seed_initial_history(self) -> None:
-        """Populate a realistic initial baseline curve so charts are rich immediately on startup."""
+        """
+        Initialize the rolling time-series window.
+        When `demo_mode` is False (default), seeds zero-valued baseline slots rather than
+        fabricating synthetic traffic history. When `demo_mode` is True, populates synthetic demo waves.
+        """
         now = datetime.now()
         for i in range(36, 0, -1):
             ts = now - timedelta(minutes=i * 2)
+            if not self.demo_mode:
+                self._samples.append(
+                    TrafficSample(
+                        timestamp=ts.strftime("%H:%M"),
+                        full_timestamp=ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        bitrate_mbps=0.0,
+                        tcp_mbps=0.0,
+                        udp_mbps=0.0,
+                        packets_per_sec=0.0,
+                        flow_rate_fps=0.0,
+                        unique_ips=0,
+                        site_mbps=0.0,
+                        gateway_mbps=0.0,
+                        vendor_breakdown={
+                            "LAN-Core": 0.0,
+                            "Gateway": 0.0,
+                            "Workstations": 0.0,
+                            "IoT-Nodes": 0.0,
+                            "External": 0.0,
+                        },
+                        tcp_flags={name: 0.0 for name, _, _ in TCP_FLAG_SERIES},
+                        is_estimated=True,
+                    )
+                )
+                continue
+
             phase = (36 - i) * 0.28
             wave1 = math.sin(phase) * 0.5 + 0.5
             wave2 = math.cos(phase * 0.7) * 0.5 + 0.5
@@ -142,6 +293,7 @@ class TrafficMonitor:
                         "External": round(total_mbps * 0.09, 1),
                     },
                     tcp_flags=flags,
+                    is_estimated=True,
                 )
             )
 
@@ -152,16 +304,16 @@ class TrafficMonitor:
             return f"{count / 1_000_000:.1f}M"
         if count >= 1_000:
             return f"{count / 1_000:.1f}K"
-        return str(count)
+        return str(max(0, count))
 
     @staticmethod
     def format_Mbps(mbps: float) -> str:
-        """Format throughput cleanly like '154Mbps' or '24.8Mbps'."""
+        """Format throughput cleanly like '154Mbps', '24.8Mbps', or '0.00Mbps'."""
         if mbps >= 100.0:
             return f"{int(round(mbps))}Mbps"
         if mbps >= 1.0:
             return f"{mbps:.1f}Mbps"
-        return f"{max(0.1, mbps):.2f}Mbps"
+        return f"{max(0.0, mbps):.2f}Mbps"
 
     @staticmethod
     def evaluate_nql_clause(clause: str, rec) -> Optional[bool]:
@@ -288,6 +440,46 @@ class TrafficMonitor:
             return q
         return None
 
+    @staticmethod
+    def _sample_os_socket_telemetry(online_ips: Optional[List[str]] = None) -> Tuple[int, int, int, Dict[str, float]]:
+        """
+        Inspect active OS inet socket connections via `psutil.net_connections` to obtain
+        real TCP/UDP flow counts, unique peer IP cardinality, and socket-state flag estimates.
+        """
+        import socket as _sock
+
+        tcp_flows = 0
+        udp_flows = 0
+        peer_ips: set[str] = set(online_ips or [])
+        flags: Dict[str, float] = {name: 0.0 for name, _, _ in TCP_FLAG_SERIES}
+
+        try:
+            conns = psutil.net_connections(kind="inet")
+            for c in conns:
+                if c.raddr and getattr(c.raddr, "ip", None):
+                    rip = str(c.raddr.ip)
+                    if not rip.startswith("127.") and rip not in ("0.0.0.0", "::", "::1"):
+                        peer_ips.add(rip)
+                if c.type == _sock.SOCK_STREAM:
+                    tcp_flows += 1
+                    st = str(getattr(c, "status", "")).upper()
+                    if st == "ESTABLISHED":
+                        flags["ACK PSH"] = flags.get("ACK PSH", 0.0) + 1.0
+                    elif st == "SYN_SENT":
+                        flags["SYN"] = flags.get("SYN", 0.0) + 1.0
+                    elif st in ("SYN_RECV", "SYN_RCVD"):
+                        flags["ACK SYN"] = flags.get("ACK SYN", 0.0) + 1.0
+                    elif st in ("FIN_WAIT1", "FIN_WAIT2", "CLOSE_WAIT", "TIME_WAIT", "LAST_ACK"):
+                        flags["ACK FIN"] = flags.get("ACK FIN", 0.0) + 1.0
+                    elif st == "LISTEN":
+                        flags["No flags set"] = flags.get("No flags set", 0.0) + 1.0
+                elif c.type == _sock.SOCK_DGRAM:
+                    udp_flows += 1
+        except Exception:
+            pass
+
+        return tcp_flows, udp_flows, len(peer_ips), flags
+
     def record_tick(
         self,
         db: Optional[DatabaseManager] = None,
@@ -331,33 +523,72 @@ class TrafficMonitor:
         online_devices = db.get_all_devices(online_only=True) if db else []
         all_devices = db.get_all_devices(online_only=False) if db else []
         unresolved_alerts = db.get_alerts(unresolved_only=True) if db else []
-
-        # Combine real NIC traffic with active LAN telemetry wave so visual charts remain responsive
-        phase = self._tick * 0.35
-        wave_tcp = math.sin(phase) * 0.5 + 0.5
-        wave_udp = math.cos(phase * 0.8 + 1.1) * 0.5 + 0.5
-        alert_boost = 1.0 + min(1.2, len(unresolved_alerts) * 0.22)
-
-        tcp_mbps = round(max(measured_mbps * 0.72, (62.0 + 135.0 * wave_tcp) * alert_boost), 2)
-        udp_mbps = round(max(measured_mbps * 0.28, (32.0 + 88.0 * wave_udp) * alert_boost), 2)
-        total_mbps = round(tcp_mbps + udp_mbps, 2)
-        pps = round(max(measured_pps, total_mbps * 58.0 + 950.0 * wave_tcp), 1)
-        fps = round(70.0 + len(online_devices) * 14.0 + 120.0 * wave_tcp * alert_boost, 1)
-        uniq_ips = max(len(online_devices), int(14 + 18 * wave_udp + len(all_devices) * 2))
-
         dt_now = datetime.now()
-        flags: Dict[str, float] = {
-            "ACK SYN FIN": round(3400.0 + 4600.0 * wave_tcp, 1),
-            "SYN": round(520.0 + (9800.0 if unresolved_alerts else 700.0 * wave_udp), 1),
-            "No flags set": round(58.0 + 30.0 * wave_tcp, 2),
-            "ACK SYN": round(32.0 + 40.0 * wave_udp, 2),
-            "URG PSH SYN FIN": round(2.0 + (18.0 if unresolved_alerts else 4.0 * wave_tcp), 2),
-            "ACK PSH": round(64.0 + 22.0 * wave_udp, 2),
-            "SYN FIN": round(190.0 + 210.0 * wave_tcp, 1),
-            "ACK PSH SYN": round(9.0 + 12.0 * wave_udp, 2),
-            "ACK FIN": round(15.0 + 18.0 * wave_tcp, 2),
-            "ACK PSH FIN": round(4.5 + 6.5 * wave_udp, 2),
-        }
+
+        if self._window_packets > 0 and not self.demo_mode:
+            # 1. Live Raw Packet Capture path (ingested via NativePacketEngine)
+            cap_mbps = (self._window_bytes * 8.0) / (dt * 1_000_000.0)
+            total_mbps = round(max(measured_mbps, cap_mbps), 2)
+            tcp_ratio = self._window_tcp_bytes / max(1, self._window_bytes)
+            udp_ratio = self._window_udp_bytes / max(1, self._window_bytes)
+            tcp_mbps = round(total_mbps * tcp_ratio, 2)
+            udp_mbps = round(total_mbps * udp_ratio, 2)
+            pps = round(max(measured_pps, self._window_packets / dt), 1)
+            fps = round(float(len(self._window_ips)), 1)
+            uniq_ips = max(len(online_devices), len(self._window_ips))
+            flags = {name: round(self._window_tcp_flags.get(name, 0.0), 2) for name, _, _ in TCP_FLAG_SERIES}
+            is_estimated = False
+
+            self._window_bytes = 0
+            self._window_tcp_bytes = 0
+            self._window_udp_bytes = 0
+            self._window_icmp_bytes = 0
+            self._window_packets = 0
+            self._window_ips.clear()
+            self._window_tcp_flags.clear()
+        elif not self.demo_mode:
+            # 2. Honest OS NIC Counters + Active Socket Telemetry (No synthetic sine waves!)
+            online_ips = [d.ip for d in online_devices if d.ip]
+            tcp_flows, udp_flows, uniq_ips_count, sock_flags = self._sample_os_socket_telemetry(online_ips)
+            self._last_os_tcp_flows = tcp_flows
+            self._last_os_udp_flows = udp_flows
+            total_flows = max(1, tcp_flows + udp_flows)
+            tcp_share = (tcp_flows / total_flows) if (tcp_flows + udp_flows) > 0 else 0.75
+
+            total_mbps = round(measured_mbps, 2)
+            tcp_mbps = round(total_mbps * tcp_share, 2)
+            udp_mbps = round(max(0.0, total_mbps - tcp_mbps), 2)
+            pps = round(measured_pps, 1)
+            fps = round(float(tcp_flows + udp_flows), 1)
+            uniq_ips = max(len(online_devices), uniq_ips_count)
+            flags = sock_flags
+            is_estimated = True
+        else:
+            # 3. Explicit Demo / Synthetic Telemetry Mode (only when demo_mode=True)
+            phase = self._tick * 0.35
+            wave_tcp = math.sin(phase) * 0.5 + 0.5
+            wave_udp = math.cos(phase * 0.8 + 1.1) * 0.5 + 0.5
+            alert_boost = 1.0 + min(1.2, len(unresolved_alerts) * 0.22)
+
+            tcp_mbps = round(max(measured_mbps * 0.72, (62.0 + 135.0 * wave_tcp) * alert_boost), 2)
+            udp_mbps = round(max(measured_mbps * 0.28, (32.0 + 88.0 * wave_udp) * alert_boost), 2)
+            total_mbps = round(tcp_mbps + udp_mbps, 2)
+            pps = round(max(measured_pps, total_mbps * 58.0 + 950.0 * wave_tcp), 1)
+            fps = round(70.0 + len(online_devices) * 14.0 + 120.0 * wave_tcp * alert_boost, 1)
+            uniq_ips = max(len(online_devices), int(14 + 18 * wave_udp + len(all_devices) * 2))
+            flags = {
+                "ACK SYN FIN": round(3400.0 + 4600.0 * wave_tcp, 1),
+                "SYN": round(520.0 + (9800.0 if unresolved_alerts else 700.0 * wave_udp), 1),
+                "No flags set": round(58.0 + 30.0 * wave_tcp, 2),
+                "ACK SYN": round(32.0 + 40.0 * wave_udp, 2),
+                "URG PSH SYN FIN": round(2.0 + (18.0 if unresolved_alerts else 4.0 * wave_tcp), 2),
+                "ACK PSH": round(64.0 + 22.0 * wave_udp, 2),
+                "SYN FIN": round(190.0 + 210.0 * wave_tcp, 1),
+                "ACK PSH SYN": round(9.0 + 12.0 * wave_udp, 2),
+                "ACK FIN": round(15.0 + 18.0 * wave_tcp, 2),
+                "ACK PSH FIN": round(4.5 + 6.5 * wave_udp, 2),
+            }
+            is_estimated = True
 
         sample = TrafficSample(
             timestamp=dt_now.strftime("%H:%M:%S"),
@@ -378,6 +609,7 @@ class TrafficMonitor:
                 "External": round(total_mbps * 0.09, 1),
             },
             tcp_flags=flags,
+            is_estimated=is_estimated,
         )
         self._samples.append(sample)
 
@@ -445,6 +677,31 @@ class TrafficMonitor:
                 ("udp", 15.0, "#8B5CF6"),
                 ("icmp", 45.0, "#10B981"),
             ]
+        elif not self.demo_mode and self._ingested_packets_total > 0:
+            total_ing = max(
+                1,
+                self._ingested_tcp_packets
+                + self._ingested_udp_packets
+                + self._ingested_icmp_packets
+                + self._ingested_arp_packets,
+            )
+            t_pct = round((self._ingested_tcp_packets / total_ing) * 100.0, 1)
+            u_pct = round((self._ingested_udp_packets / total_ing) * 100.0, 1)
+            i_pct = round(max(0.0, 100.0 - t_pct - u_pct), 1)
+            protocol_breakdown = [
+                ("tcp", t_pct, "#F59E0B"),
+                ("udp", u_pct, "#8B5CF6"),
+                ("icmp", i_pct, "#10B981"),
+            ]
+        elif not self.demo_mode and (self._last_os_tcp_flows + self._last_os_udp_flows) > 0:
+            tot_fl = float(self._last_os_tcp_flows + self._last_os_udp_flows)
+            t_pct = round((self._last_os_tcp_flows / tot_fl) * 100.0, 1)
+            u_pct = round(max(0.0, 100.0 - t_pct), 1)
+            protocol_breakdown = [
+                ("tcp", t_pct, "#F59E0B"),
+                ("udp", u_pct, "#8B5CF6"),
+                ("icmp", 0.0, "#10B981"),
+            ]
         else:
             protocol_breakdown = [
                 ("tcp", 88.0, "#F59E0B"),
@@ -472,6 +729,19 @@ class TrafficMonitor:
                 (lbl, round((cnt / total_p) * 100.0, 1), port_palette[idx % len(port_palette)][0])
                 for idx, (lbl, cnt) in enumerate(sorted_ports)
             ]
+        elif not self.demo_mode and self._ingested_port_counts:
+            from src.security.port_scanner import PortScanner
+
+            sorted_ing = sorted(self._ingested_port_counts.items(), key=lambda x: x[1], reverse=True)[:6]
+            total_p = max(1, sum(c for _, c in sorted_ing))
+            port_breakdown = [
+                (
+                    f"{prt} {PortScanner.get_service_name(prt)[:10]}",
+                    round((cnt / total_p) * 100.0, 1),
+                    port_palette[idx % len(port_palette)][0],
+                )
+                for idx, (prt, cnt) in enumerate(sorted_ing)
+            ]
         else:
             port_breakdown = [
                 ("443 https", 55.0, "#0EA5E9"),
@@ -494,13 +764,13 @@ class TrafficMonitor:
             samples_list = samples_list[-28:]
 
         latest = samples_list[-1] if samples_list else None
-        cur_mbps = latest.bitrate_mbps if latest else 154.0
+        cur_mbps = latest.bitrate_mbps if latest else 0.0
         if proto_focus == "udp" and latest:
             cur_mbps = latest.udp_mbps
         elif proto_focus == "tcp" and latest:
             cur_mbps = latest.tcp_mbps
 
-        display_packets = max(1_200_000, self._last_packets)
+        display_packets = max(0, self._last_packets)
 
         # Compute Flows Spiral intensities according to selected metric ("bitrate", "packets", "flows")
         metric_key = metric_mode.strip().lower()
@@ -513,10 +783,25 @@ class TrafficMonitor:
                 (s.udp_mbps if proto_focus == "udp" else (s.tcp_mbps if proto_focus == "tcp" else s.bitrate_mbps))
                 for s in samples_list
             ]
-        max_metric = max(vals, default=250.0)
+        max_metric = max(vals, default=1.0)
+        if max_metric <= 0.0:
+            max_metric = 1.0
         spiral_intensities = [
-            min(1.0, max(0.08, v / max(1.0, max_metric))) for v in vals
+            min(1.0, max(0.08, v / max_metric)) for v in vals
         ]
+
+        if self.demo_mode:
+            telemetry_mode = "DEMO_SYNTHETIC"
+            telemetry_label = "Demo / Simulated Telemetry Mode (Synthetic Waveform)"
+            is_estimated = True
+        elif self._ingested_packets_total > 0 and latest and not latest.is_estimated:
+            telemetry_mode = "LIVE_PCAP"
+            telemetry_label = "Live Packet Capture (Native C Engine)"
+            is_estimated = False
+        else:
+            telemetry_mode = "ESTIMATED_NIC"
+            telemetry_label = "OS NIC Counters + Estimated Telemetry (Demo/Estimated without Live Pcap)"
+            is_estimated = True
 
         return TelemetrySnapshot(
             total_packets=display_packets,
@@ -532,4 +817,8 @@ class TrafficMonitor:
             samples=samples_list,
             spiral_intensities=spiral_intensities,
             active_nql=query_clean,
+            is_estimated=is_estimated,
+            telemetry_mode=telemetry_mode,
+            telemetry_label=telemetry_label,
         )
+

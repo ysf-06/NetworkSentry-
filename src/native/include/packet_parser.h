@@ -63,6 +63,7 @@ typedef struct {
     int dst_port;           /* TCP/UDP destination port or 0 */
     int ttl;                /* IPv4 Time-To-Live */
     int total_length;       /* IPv4 total packet length */
+    int tcp_flags;          /* TCP flags bitmask (FIN=1, SYN=2, RST=4, PSH=8, ACK=16, URG=32) */
     int is_valid;
 } ParsedIpPacket;
 

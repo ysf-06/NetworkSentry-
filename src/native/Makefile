@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS = -O3 -Wall -Wextra -Iinclude
+CFLAGS = -O3 -Wall -Wextra -Werror -Iinclude
 
 ifeq ($(OS),Windows_NT)
     SHARED_EXT = dll
@@ -22,7 +22,7 @@ $(SHARED_LIB): src/packet_parser.c include/packet_parser.h
 $(TEST_BIN): src/packet_parser.c src/test_packet_parser.c include/packet_parser.h
 	$(CC) $(CFLAGS) -DBUILDING_PACKET_PARSER src/packet_parser.c src/test_packet_parser.c -o $(TEST_BIN) $(LDFLAGS)
 
-test: $(TEST_BIN)
+test: $(SHARED_LIB) $(TEST_BIN)
 	./$(TEST_BIN)
 
 clean:

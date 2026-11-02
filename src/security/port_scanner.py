@@ -1,5 +1,7 @@
 """Concurrent TCP port scanner and service banner grabber."""
 
+import errno
+import select
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -81,30 +83,63 @@ class PortScanner:
         """
         Attempt a TCP connection to `(ip, port)`.
         Returns a `PortScanRecord` if the port is open, or `None` if closed/filtered.
+        Logs any non-zero errno or OSError code at DEBUG level for diagnostics.
         """
+        target_port = int(port)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.timeout)
-                result = sock.connect_ex((ip, int(port)))
+                result = sock.connect_ex((ip, target_port))
+                if result in (errno.EINPROGRESS, errno.EWOULDBLOCK, 10035, 10036):
+                    _, writable, exceptional = select.select([], [sock], [sock], self.timeout)
+                    if writable or exceptional:
+                        result = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if result == 0 and not writable:
+                            result = errno.ECONNREFUSED
+                    else:
+                        result = getattr(errno, "WSAETIMEDOUT", errno.ETIMEDOUT)
+
                 if result != 0:
+                    err_name = errno.errorcode.get(result, "CLOSED_OR_FILTERED")
+                    logger.debug(
+                        "TCP probe %s:%d closed/filtered (errno=%d, %s)",
+                        ip,
+                        target_port,
+                        result,
+                        err_name,
+                    )
                     return None
 
-                service = self.get_service_name(port)
+                service = self.get_service_name(target_port)
                 banner = ""
                 if self.grab_banners:
-                    banner = self._try_grab_banner(sock, ip, port)
+                    banner = self._try_grab_banner(sock, ip, target_port)
 
                 return PortScanRecord(
                     mac=mac.upper().strip(),
                     ip=ip,
-                    port=int(port),
+                    port=target_port,
                     protocol="TCP",
                     service=service,
                     banner=banner,
                     state="OPEN",
                     scanned_at=datetime.now().isoformat(timespec="seconds"),
                 )
-        except OSError:
+        except OSError as exc:
+            err_code = getattr(exc, "winerror", None) or getattr(exc, "errno", None) or -1
+            err_name = (
+                errno.errorcode.get(int(err_code), type(exc).__name__)
+                if isinstance(err_code, int)
+                else type(exc).__name__
+            )
+            logger.debug(
+                "TCP probe %s:%d raised OSError (errno=%s, %s): %s",
+                ip,
+                target_port,
+                err_code,
+                err_name,
+                exc,
+            )
             return None
 
     def _try_grab_banner(self, sock: socket.socket, ip: str, port: int) -> str:
@@ -121,7 +156,9 @@ class PortScanner:
             # Sanitize printable ASCII
             clean = "".join(ch for ch in first_line if 32 <= ord(ch) <= 126)
             return clean[:120]
-        except OSError:
+        except OSError as exc:
+            err_code = getattr(exc, "winerror", None) or getattr(exc, "errno", None) or -1
+            logger.debug("Banner read on %s:%d ended (errno=%s): %s", ip, port, err_code, exc)
             return ""
 
     def scan_host(

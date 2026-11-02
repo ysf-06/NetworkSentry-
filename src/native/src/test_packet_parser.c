@@ -96,14 +96,14 @@ static void test_malformed_and_truncated_packets(void) {
     assert(pkt.vlan_id == 42);
     assert(pkt.opcode == 2);
 
-    /* IPv4 with IHL = 6 (24-byte header with options) and boundary TCP port extraction */
-    uint8_t ipv4_opt[42] = {0};
+    /* IPv4 with IHL = 6 (24-byte header with options) and boundary TCP port + flags extraction */
+    uint8_t ipv4_opt[56] = {0};
     ParsedIpPacket ip_pkt;
     memcpy(ipv4_opt + 0, mac, 6);
     memcpy(ipv4_opt + 6, mac, 6);
     ipv4_opt[12] = 0x08; ipv4_opt[13] = 0x00; /* IPv4 */
     ipv4_opt[14] = 0x46; /* Version 4, IHL = 6 (24 bytes) */
-    ipv4_opt[16] = 0x00; ipv4_opt[17] = 28; /* total_length = 28 */
+    ipv4_opt[16] = 0x00; ipv4_opt[17] = 42; /* total_length = 42 */
     ipv4_opt[22] = 64;   /* TTL */
     ipv4_opt[23] = 6;    /* TCP */
     memcpy(ipv4_opt + 26, ip, 4);
@@ -111,13 +111,18 @@ static void test_malformed_and_truncated_packets(void) {
     /* 4 bytes of IPv4 options at 34..37, then TCP ports at 38..41 */
     ipv4_opt[38] = 0x1F; ipv4_opt[39] = 0x90; /* src_port = 8080 */
     ipv4_opt[40] = 0x01; ipv4_opt[41] = 0xBB; /* dst_port = 443 */
+    ipv4_opt[51] = 0x12; /* TCP flags at l4 + 13 (38 + 13 = 51): SYN + ACK */
 
     /* Truncated before IHL finishes (37 bytes < 14 + 24) -> -4 */
     assert(parse_ipv4_packet(ipv4_opt, 37, &ip_pkt) == -4);
-    /* Full 42 bytes -> parses options + TCP ports */
+    /* 42 bytes -> parses options + TCP ports, tcp_flags = 0 (truncated before l4+14) */
     assert(parse_ipv4_packet(ipv4_opt, 42, &ip_pkt) == 0);
     assert(ip_pkt.src_port == 8080);
     assert(ip_pkt.dst_port == 443);
+    assert(ip_pkt.tcp_flags == 0);
+    /* Full 52+ bytes -> parses TCP flags as well */
+    assert(parse_ipv4_packet(ipv4_opt, 52, &ip_pkt) == 0);
+    assert(ip_pkt.tcp_flags == 0x12);
 
     /* Bogus total_length < ihl -> -4 */
     ipv4_opt[17] = 10;

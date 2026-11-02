@@ -184,6 +184,9 @@ NS_EXPORT int parse_ipv4_packet(
         const uint8_t *l4 = ip + ihl;
         out_pkt->src_port = (int)read_be16(l4 + 0);
         out_pkt->dst_port = (int)read_be16(l4 + 2);
+        if (out_pkt->protocol == 6 && length >= ip_offset + ihl + 14) {
+            out_pkt->tcp_flags = (int)(l4[13] & 0x3F);
+        }
     }
 
     out_pkt->is_valid = 1;
@@ -238,6 +241,13 @@ NS_EXPORT int build_arp_frame(
 NS_EXPORT int is_pcap_available(void) {
 #ifdef _WIN32
     HMODULE hMod = LoadLibraryA("wpcap.dll");
+    if (hMod == NULL) {
+        hMod = LoadLibraryExA(
+            "C:\\Windows\\System32\\Npcap\\wpcap.dll",
+            NULL,
+            LOAD_WITH_ALTERED_SEARCH_PATH
+        );
+    }
     if (hMod != NULL) {
         FreeLibrary(hMod);
         return 1;
@@ -257,5 +267,5 @@ NS_EXPORT int is_pcap_available(void) {
 }
 
 NS_EXPORT const char* packet_engine_version(void) {
-    return "NetworkSentry-NativeEngine/1.0.0";
+    return "NetworkSentry-NativeEngine/1.1.0";
 }

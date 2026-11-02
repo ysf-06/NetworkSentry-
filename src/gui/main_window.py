@@ -175,7 +175,11 @@ class MainWindow(QMainWindow):
         self.risk_engine = RiskEngine()
         self.c_engine = NativePacketEngine(auto_compile=True)
         self.notifier = SystemNotifier(enabled=True)
-        self.traffic_monitor = TrafficMonitor(max_samples=60)
+        self.traffic_monitor = TrafficMonitor(
+            max_samples=60,
+            demo_mode=False,
+            c_engine=self.c_engine,
+        )
 
         self.interfaces: List[NetworkInterfaceInfo] = InterfaceDetector.list_interfaces(
             include_loopback=False
@@ -271,6 +275,18 @@ class MainWindow(QMainWindow):
             self._nav_buttons.append(btn)
 
         top_lay.addStretch()
+
+        self.lbl_telemetry_badge = QLabel("Telemetry: Estimated / NIC Counters")
+        self.lbl_telemetry_badge.setFixedHeight(28)
+        self.lbl_telemetry_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_telemetry_badge.setStyleSheet(
+            "background-color: #2A2111; color: #FBBF24; border: 1px solid #92400E; "
+            "border-radius: 14px; padding: 4px 12px; font-size: 11px; font-weight: 700;"
+        )
+        self.lbl_telemetry_badge.setToolTip(
+            "Indicates whether metrics come from live packet capture, OS NIC/socket counters (estimated), or simulated demo telemetry."
+        )
+        top_lay.addWidget(self.lbl_telemetry_badge)
 
         c_status = "C Engine: ACTIVE" if self.c_engine.is_native_loaded else "C Engine: Fallback"
         self.lbl_c_badge = QLabel(c_status)
@@ -553,9 +569,9 @@ class MainWindow(QMainWindow):
         cf_lay.setContentsMargins(16, 12, 16, 10)
         cf_lay.setSpacing(4)
         cf_hdr = QHBoxLayout()
-        lbl_cf = QLabel("Real-Time Packet Flow")
-        lbl_cf.setObjectName("CardHeaderTitle")
-        cf_hdr.addWidget(lbl_cf)
+        self.lbl_packet_flow_title = QLabel("Packet Flow (NIC Counters / Estimated Telemetry)")
+        self.lbl_packet_flow_title.setObjectName("CardHeaderTitle")
+        cf_hdr.addWidget(self.lbl_packet_flow_title)
         cf_hdr.addStretch()
         self.combo_timeline_window = QComboBox()
         self.combo_timeline_window.addItems(["Live Timeline", "Last 15m", "Last 1h"])
@@ -689,28 +705,32 @@ class MainWindow(QMainWindow):
         card_stats.setObjectName("CyberCard")
         cs_lay = QVBoxLayout(card_stats)
         cs_lay.setContentsMargins(16, 12, 16, 14)
-        cs_lay.setSpacing(8)
+        cs_lay.setSpacing(6)
 
         lbl_cs = QLabel("Packet Traffic Statistics")
         lbl_cs.setObjectName("CardHeaderTitle")
         cs_lay.addWidget(lbl_cs)
-        cs_lay.addSpacing(4)
+
+        self.lbl_telemetry_source_note = QLabel("Estimated Telemetry (NIC Counters — Live Pcap Inactive)")
+        self.lbl_telemetry_source_note.setStyleSheet("color: #F59E0B; font-size: 10px; font-weight: 700;")
+        self.lbl_telemetry_source_note.setWordWrap(True)
+        cs_lay.addWidget(self.lbl_telemetry_source_note)
 
         lbl_tp_cap = QLabel("Total Packets")
         lbl_tp_cap.setObjectName("KpiLabel")
         cs_lay.addWidget(lbl_tp_cap)
 
-        self.lbl_total_packets = QLabel("1.2M")
+        self.lbl_total_packets = QLabel("0")
         self.lbl_total_packets.setObjectName("StatHugeWhite")
         cs_lay.addWidget(self.lbl_total_packets)
 
-        cs_lay.addSpacing(6)
+        cs_lay.addSpacing(4)
 
         lbl_bps_cap = QLabel("Bits/Sec")
         lbl_bps_cap.setObjectName("KpiLabel")
         cs_lay.addWidget(lbl_bps_cap)
 
-        self.lbl_bits_per_sec = QLabel("154Mbps")
+        self.lbl_bits_per_sec = QLabel("0.0Mbps")
         self.lbl_bits_per_sec.setObjectName("StatHugeGold")
         cs_lay.addWidget(self.lbl_bits_per_sec)
 
@@ -952,6 +972,15 @@ class MainWindow(QMainWindow):
         self.chk_sync_hover.setStyleSheet("color: #38BDF8; font-weight: 700; font-size: 11px;")
         sub_lay.addWidget(self.chk_sync_hover)
 
+        self.chk_demo_telemetry = QCheckBox("Demo / Simulated Telemetry")
+        self.chk_demo_telemetry.setChecked(False)
+        self.chk_demo_telemetry.setToolTip(
+            "Enable synthetic demo traffic waveforms for UI preview. Leave unchecked for honest NIC/socket telemetry."
+        )
+        self.chk_demo_telemetry.setStyleSheet("color: #F59E0B; font-weight: 700; font-size: 11px;")
+        self.chk_demo_telemetry.toggled.connect(self._on_demo_telemetry_toggled)
+        sub_lay.addWidget(self.chk_demo_telemetry)
+
         sub_lay.addStretch()
         alay.addWidget(sub_bar)
 
@@ -1086,6 +1115,10 @@ class MainWindow(QMainWindow):
             return
         for ch in self._telemetry_charts:
             ch.set_hover_ratio(ratio)
+
+    def _on_demo_telemetry_toggled(self, checked: bool) -> None:
+        self.traffic_monitor.set_demo_mode(checked)
+        self._update_telemetry_views()
 
     # =========================================================================
     # PAGE 3: LOGS — SECURITY ALERTS FEED & DEVICE STATE HISTORY
@@ -1288,6 +1321,18 @@ class MainWindow(QMainWindow):
         self.lbl_total_packets.setText(snap.total_packets_formatted)
         self.lbl_bits_per_sec.setText(snap.bits_per_sec_formatted)
 
+        # Explicitly disclose whether telemetry is Live Capture, Estimated (NIC Counters), or Demo
+        self.lbl_telemetry_source_note.setText(snap.telemetry_label)
+        if "DEMO" in snap.telemetry_mode.upper():
+            self.lbl_packet_flow_title.setText("Packet Flow (Demo / Simulated Telemetry)")
+            self.lbl_telemetry_badge.setText("Telemetry: Demo / Simulated")
+        elif snap.is_estimated:
+            self.lbl_packet_flow_title.setText("Packet Flow (NIC Counters / Estimated Telemetry)")
+            self.lbl_telemetry_badge.setText("Telemetry: Estimated / NIC Counters")
+        else:
+            self.lbl_packet_flow_title.setText("Real-Time Packet Flow (Live Packet Capture)")
+            self.lbl_telemetry_badge.setText("Telemetry: Live Packet Capture")
+
         if self.active_interface:
             gw = self.active_interface.gateway_ip or "N/A"
             self.lbl_iface_mini.setText(
@@ -1470,6 +1515,7 @@ class MainWindow(QMainWindow):
             target_mac="FF:FF:FF:FF:FF:FF",
             target_ip=gw_ip,
         )
+        self.traffic_monitor.ingest_raw_packet(raw_frame)
         parsed = self.c_engine.parse_arp_packet(raw_frame)
         if parsed is None:
             return

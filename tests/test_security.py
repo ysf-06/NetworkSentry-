@@ -220,3 +220,71 @@ def test_risk_engine_classification_tiers(tmp_path: Path) -> None:
     res_crit = engine.evaluate_device(dev_medium, active_alerts=[spoof_alert], db=db)
     assert res_crit.risk_level == "CRITICAL"
     assert res_crit.risk_score >= 90
+
+
+def test_port_scanner_logs_errno_on_closed_port_and_oserror(caplog, monkeypatch) -> None:
+    """Verify that PortScanner logs exact errno/winerror details to debug log when connect_ex or OSError occurs."""
+    import errno
+    import logging
+    from src.security import port_scanner as ps_mod
+
+    # Production logger must have DEBUG effective level so RotatingFileHandler receives DEBUG records
+    assert ps_mod.logger.isEnabledFor(logging.DEBUG) is True
+
+    monkeypatch.setattr(ps_mod.logger, "propagate", True)
+    scanner = PortScanner(timeout=0.25, grab_banners=False)
+
+    # 1. Closed port on 127.0.0.1 logs errno in debug log
+    closed_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    closed_sock.bind(("127.0.0.1", 0))
+    closed_port = closed_sock.getsockname()[1]
+    closed_sock.close()
+
+    with caplog.at_level(logging.DEBUG, logger="PortScanner"):
+        res = scanner.probe_port("127.0.0.1", closed_port, mac="AA:BB:CC:11:22:33")
+    assert res is None
+    assert any("errno=" in rec.message for rec in caplog.records)
+
+    # 2. Explicit OSError with ECONNREFUSED logs exact errno and symbol name
+    caplog.clear()
+
+    class FailingSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def setblocking(self, flag):
+            pass
+
+        def connect_ex(self, addr):
+            raise OSError(errno.ECONNREFUSED, "Connection refused by test")
+
+    monkeypatch.setattr(ps_mod.socket, "socket", lambda *a, **kw: FailingSocket())
+    with caplog.at_level(logging.DEBUG, logger="PortScanner"):
+        res2 = scanner.probe_port("127.0.0.1", 9999, mac="AA:BB:CC:11:22:33")
+    assert res2 is None
+    assert any(
+        f"errno={errno.ECONNREFUSED}" in rec.message and "ECONNREFUSED" in rec.message
+        for rec in caplog.records
+    )
+
+    # 3. Non-blocking WSAEWOULDBLOCK (10035) + firewall SYN drop (select timeout) logs ETIMEDOUT/WSAETIMEDOUT
+    caplog.clear()
+
+    class NonBlockingTimeoutSocket(FailingSocket):
+        def connect_ex(self, addr):
+            return 10035
+
+    monkeypatch.setattr(ps_mod.socket, "socket", lambda *a, **kw: NonBlockingTimeoutSocket())
+    monkeypatch.setattr(ps_mod.select, "select", lambda r, w, x, t: ([], [], []))
+    with caplog.at_level(logging.DEBUG, logger="PortScanner"):
+        res3 = scanner.probe_port("127.0.0.1", 9998, mac="AA:BB:CC:11:22:33")
+    assert res3 is None
+    expected_timeout_code = getattr(errno, "WSAETIMEDOUT", errno.ETIMEDOUT)
+    assert any(f"errno={expected_timeout_code}" in rec.message for rec in caplog.records)
+

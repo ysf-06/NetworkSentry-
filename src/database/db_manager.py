@@ -13,13 +13,15 @@ from src.database.models import (
     ScanSessionRecord,
     SecurityAlertRecord,
 )
+from src.utils.logger import resolve_data_path
 
 
 class DatabaseManager:
     """Manages SQLite database connections, schema migrations, and queries."""
 
     def __init__(self, db_path: str | Path = "networksentry.db", wal_mode: bool = True) -> None:
-        self.db_path = Path(db_path)
+        raw_path = Path(db_path)
+        self.db_path = raw_path if raw_path.is_absolute() else resolve_data_path(raw_path, seed_from_bundle=True)
         self.wal_mode = wal_mode
         self._lock = threading.RLock()
         self.initialize_schema()

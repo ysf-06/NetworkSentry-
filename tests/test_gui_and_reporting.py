@@ -301,3 +301,84 @@ def test_cyber_guardian_dashboard_and_traffic_overview_widgets(tmp_path: Path) -
     win.close()
 
 
+def test_traffic_monitor_no_fabricated_startup_waves_and_honest_labeling(tmp_path: Path) -> None:
+    """Verify P1 #1 fix: TrafficMonitor does not fabricate startup sine waves or inflate counters by default."""
+    import struct
+    from src.core.traffic_monitor import TrafficMonitor
+    from src.native.c_bridge import NativePacketEngine
+
+    _get_qapp()
+    db = DatabaseManager(db_path=tmp_path / "telemetry_honest.db")
+    cfg = ConfigManager(tmp_path / "config.json")
+    c_engine = NativePacketEngine(auto_compile=True)
+
+    tm = TrafficMonitor(max_samples=60, demo_mode=False, c_engine=c_engine)
+    # Startup baseline samples must all be zero (no fabricated historical sine wave)
+    assert all(s.tcp_mbps == 0.0 and s.udp_mbps == 0.0 and s.bitrate_mbps == 0.0 for s in tm._samples)
+
+    snap0 = tm.build_snapshot(db=db)
+    assert snap0.is_estimated is True
+    assert snap0.telemetry_mode == "ESTIMATED_NIC"
+    assert "Estimated" in snap0.telemetry_label
+    assert snap0.bits_per_sec_formatted == "0.00Mbps"
+
+    # Ingest real Ethernet + IPv4 + TCP SYN+ACK packet via C engine
+    eth_hdr = bytes.fromhex("50c7bf000001a434d91122330800")
+    ip_hdr = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 40, 1234, 0, 64, 6, 0,
+        bytes([192, 168, 1, 10]),
+        bytes([192, 168, 1, 1]),
+    )
+    tcp_hdr = struct.pack("!HHIIBBHHH", 54321, 443, 1, 1, 0x50, 0x12, 65535, 0, 0)
+    assert tm.ingest_raw_packet(eth_hdr + ip_hdr + tcp_hdr) is True
+
+    snap_live = tm.record_tick(db=db)
+    assert snap_live.is_estimated is False
+    assert snap_live.telemetry_mode == "LIVE_PCAP"
+    assert "Live Packet Capture" in snap_live.telemetry_label
+    assert snap_live.samples[-1].tcp_flags.get("ACK SYN", 0.0) >= 1.0
+    assert snap_live.protocol_breakdown[0] == ("tcp", 100.0, "#F59E0B")
+    assert snap_live.port_breakdown[0][0] == "443 https"
+    assert snap_live.port_breakdown[0][1] == 100.0
+
+    # Verify MainWindow explicitly displays "Estimated" / "NIC Counters" on startup
+    win = MainWindow(config=cfg, db=db)
+    assert "Estimated" in win.lbl_packet_flow_title.text()
+    assert "Estimated" in win.lbl_telemetry_badge.text()
+    assert "Estimated" in win.lbl_telemetry_source_note.text()
+
+    # Toggling Demo Telemetry explicitly marks UI as "Demo / Simulated"
+    win.chk_demo_telemetry.setChecked(True)
+    assert "Demo" in win.lbl_packet_flow_title.text()
+    assert "Demo" in win.lbl_telemetry_badge.text()
+    win.chk_demo_telemetry.setChecked(False)
+    assert "Estimated" in win.lbl_packet_flow_title.text()
+    win.close()
+
+
+def test_appdata_writable_paths_when_cwd_unwritable(tmp_path: Path, monkeypatch) -> None:
+    """Verify P1 #2 fix: relative log/DB/config paths resolve to writable AppData and never crash."""
+    from src.utils.logger import get_app_data_dir, resolve_data_path, setup_logger
+
+    custom_appdata = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(custom_appdata))
+
+    app_dir = get_app_data_dir()
+    assert app_dir == (custom_appdata / "NetworkSentry").resolve()
+    assert app_dir.exists()
+
+    log_resolved = resolve_data_path("networksentry.log")
+    db_resolved = resolve_data_path("networksentry.db")
+    assert log_resolved.parent == app_dir
+    assert db_resolved.parent == app_dir
+
+    # Initializing logger and DatabaseManager with relative paths writes to AppData, not CWD
+    test_logger = setup_logger("TestUnwritableCwdLogger", log_file="networksentry.log")
+    test_logger.info("Verification log entry from isolated AppData test")
+    assert log_resolved.exists()
+
+    db = DatabaseManager(db_path="networksentry.db")
+    assert Path(db.check_health()["db_path"]).resolve() == db_resolved
+
+

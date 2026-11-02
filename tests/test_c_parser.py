@@ -121,6 +121,15 @@ def test_c_ipv4_tcp_packet_parsing_and_malformed_handling() -> None:
     fb_ip = fallback_engine.parse_ipv4_packet(raw_ipv4)
     assert fb_ip is not None
     assert fb_ip.src_port == 54321 and fb_ip.dst_port == 443
+    assert fb_ip.tcp_flags == 0
+
+    # Construct full 20-byte TCP header with SYN+ACK (0x12) flags at TCP byte offset 13
+    tcp_full = struct.pack("!HHIIBBHHH", 54321, 443, 1, 1, 0x50, 0x12, 65535, 0, 0)
+    raw_ipv4_tcp_flags = eth_hdr + ip_hdr + tcp_full
+    pkt_flags_c = engine.parse_ipv4_packet(raw_ipv4_tcp_flags)
+    pkt_flags_py = fallback_engine.parse_ipv4_packet(raw_ipv4_tcp_flags)
+    assert pkt_flags_c is not None and pkt_flags_c.tcp_flags == 0x12
+    assert pkt_flags_py is not None and pkt_flags_py.tcp_flags == 0x12
 
     # Malformed / truncated frames must safely return None
     assert engine.parse_arp_packet(b"") is None

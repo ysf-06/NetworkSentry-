@@ -60,6 +60,7 @@ class CStructParsedIpPacket(ctypes.Structure):
         ("dst_port", ctypes.c_int),
         ("ttl", ctypes.c_int),
         ("total_length", ctypes.c_int),
+        ("tcp_flags", ctypes.c_int),
         ("is_valid", ctypes.c_int),
     ]
 
@@ -94,6 +95,7 @@ class IpPacketInfo:
     dst_port: int
     ttl: int
     total_length: int
+    tcp_flags: int = 0
     is_valid: bool = True
 
 
@@ -392,6 +394,7 @@ class NativePacketEngine:
                 dst_port=int(c_pkt.dst_port),
                 ttl=int(c_pkt.ttl),
                 total_length=int(c_pkt.total_length),
+                tcp_flags=int(c_pkt.tcp_flags),
                 is_valid=True,
             )
 
@@ -424,9 +427,11 @@ class NativePacketEngine:
         protocol = ip_hdr[9]
         src_ip = socket.inet_ntoa(ip_hdr[12:16])
         dst_ip = socket.inet_ntoa(ip_hdr[16:20])
-        src_port, dst_port = 0, 0
+        src_port, dst_port, tcp_flags = 0, 0, 0
         if protocol in (6, 17) and len(raw_bytes) >= offset + ihl + 4:
             src_port, dst_port = struct.unpack("!HH", ip_hdr[ihl : ihl + 4])
+            if protocol == 6 and len(raw_bytes) >= offset + ihl + 14:
+                tcp_flags = ip_hdr[ihl + 13] & 0x3F
 
         return IpPacketInfo(
             src_mac=src_mac,
@@ -438,5 +443,6 @@ class NativePacketEngine:
             dst_port=dst_port,
             ttl=ttl,
             total_length=total_len,
+            tcp_flags=tcp_flags,
             is_valid=True,
         )
