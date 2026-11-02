@@ -465,6 +465,25 @@ class DatabaseManager:
                 for r in rows
             ]
 
+    def get_all_port_scans(self) -> List[PortScanRecord]:
+        """Get all discovered open ports across all devices."""
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute("SELECT * FROM port_scans ORDER BY port ASC").fetchall()
+            return [
+                PortScanRecord(
+                    id=r["id"],
+                    mac=r["mac"],
+                    ip=r["ip"],
+                    port=r["port"],
+                    protocol=r["protocol"],
+                    service=r["service"],
+                    banner=r["banner"],
+                    state=r["state"],
+                    scanned_at=r["scanned_at"],
+                )
+                for r in rows
+            ]
+
     def create_scan_session(self, session: ScanSessionRecord) -> int:
         """Start a new scan session record and return its ID."""
         with self._lock, self._get_connection() as conn:

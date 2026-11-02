@@ -3,10 +3,10 @@ setlocal
 cd /d "%~dp0"
 
 echo ======================================================================
-echo   Network Sentry v1.0.0 -- Release Build and Packaging Script
+echo   Cyber Guardian (Network Sentry) -- Windows Desktop Release Builder
 echo ======================================================================
 
-echo [1/3] Compiling Native C Packet Engine (packet_parser.dll)...
+echo [1/4] Compiling Native C Packet Engine (packet_parser.dll)...
 pushd src\native
 call build.bat
 if %ERRORLEVEL% NEQ 0 (
@@ -16,20 +16,23 @@ if %ERRORLEVEL% NEQ 0 (
 )
 popd
 
-echo [2/3] Running Pytest Verification Suite...
+echo [2/4] Running Pytest Verification Suite...
 .\.venv\Scripts\python.exe -m pytest -q
 if %ERRORLEVEL% NEQ 0 (
     echo [Error] Unit test suite failed. Aborting release build.
     exit /b 1
 )
 
-echo [3/3] Packaging Standalone Executable with PyInstaller...
+echo [3/4] Packaging Standalone Windows Desktop App with PyInstaller...
 .\.venv\Scripts\pyinstaller.exe ^
     --noconfirm ^
     --clean ^
+    --windowed ^
+    --icon "assets\cyber_guardian.ico" ^
     --name NetworkSentry ^
     --onedir ^
     --add-data "assets\oui_database.json;assets" ^
+    --add-data "assets\cyber_guardian.ico;assets" ^
     --add-binary "src\native\packet_parser.dll;src\native" ^
     --exclude-module PySide6.QtWebEngineCore ^
     --exclude-module PySide6.QtWebEngineWidgets ^
@@ -44,7 +47,20 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+echo [4/4] Creating Windows Desktop Shortcut (Cyber Guardian - Network Sentry.lnk)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$desktop = [Environment]::GetFolderPath('Desktop'); " ^
+    "$lnkPath = Join-Path $desktop 'Cyber Guardian - Network Sentry.lnk'; " ^
+    "$ws = New-Object -ComObject WScript.Shell; " ^
+    "$s = $ws.CreateShortcut($lnkPath); " ^
+    "$s.TargetPath = '%~dp0dist\NetworkSentry\NetworkSentry.exe'; " ^
+    "$s.WorkingDirectory = '%~dp0'; " ^
+    "$s.IconLocation = '%~dp0assets\cyber_guardian.ico,0'; " ^
+    "$s.Description = 'Cyber Guardian | Network Port Scanner & Packet Analyzer'; " ^
+    "$s.Save();"
+
 echo ======================================================================
 echo   Release Build Successful: dist\NetworkSentry\NetworkSentry.exe
+echo   Desktop Shortcut Created: Cyber Guardian - Network Sentry.lnk
 echo ======================================================================
 exit /b 0

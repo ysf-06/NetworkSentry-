@@ -165,24 +165,55 @@ def run_cli_scan(
 
 def run_gui(config_path: str = "config.json") -> int:
     """Launch the PySide6 Desktop Application."""
+    import ctypes
+    import os
+    from pathlib import Path
     from PySide6.QtWidgets import QApplication
     from src.gui.main_window import MainWindow
+    from src.gui.widgets.cyber_charts import create_cyber_guardian_icon
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if not Path(config_path).is_absolute() and not Path(config_path).exists():
+            os.chdir(exe_dir)
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "CyberGuardian.NetworkSentry.Desktop.1"
+            )
+        except Exception:
+            pass
 
     cfg = ConfigManager(config_path)
     setup_logger("NetworkSentry", log_file=cfg.get("logging", "file", "networksentry.log"))
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Network Sentry")
-    app.setOrganizationName("NetworkSentry")
+    app.setApplicationName("Cyber Guardian — Network Sentry")
+    app.setOrganizationName("CyberGuardian")
+    app.setWindowIcon(create_cyber_guardian_icon(64))
 
     window = MainWindow(config=cfg)
     window.show()
     return app.exec()
 
 
+def _ensure_cli_console() -> None:
+    """Attach to parent console on Windows if running CLI flags from a --windowed executable."""
+    if sys.platform == "win32" and sys.stdout is None:
+        try:
+            import ctypes
+
+            if ctypes.windll.kernel32.AttachConsole(-1):
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Network Sentry — Local Network Discovery, C Packet Engine & Security Monitor"
+        description="Cyber Guardian (Network Sentry) — Local Network Discovery, C Packet Engine & Security Monitor"
     )
     parser.add_argument(
         "--config",
@@ -212,8 +243,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.diagnostics:
+        _ensure_cli_console()
         sys.exit(run_diagnostics(config_path=args.config))
     if args.scan:
+        _ensure_cli_console()
         sys.exit(
             run_cli_scan(
                 config_path=args.config,
@@ -226,3 +259,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

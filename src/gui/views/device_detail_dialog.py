@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 
 from src.database.db_manager import DatabaseManager
 from src.database.models import DeviceRecord, PortScanRecord
-from src.gui.styles import RISK_COLORS
+from src.gui.styles import DARK_THEME_QSS, RISK_COLORS
+from src.gui.widgets.cyber_charts import create_cyber_guardian_icon
 from src.security.port_scanner import DEFAULT_SCAN_PORTS, PortScanner
 from src.security.risk_engine import RiskEngine
 
@@ -72,7 +73,9 @@ class DeviceDetailDialog(QDialog):
         self.db = db
         self._scan_worker: Optional[SingleHostPortScanWorker] = None
 
-        self.setWindowTitle(f"Device Inspector — {device.ip} ({device.mac})")
+        self.setWindowTitle(f"Cyber Guardian Inspector — {device.ip} ({device.mac})")
+        self.setWindowIcon(create_cyber_guardian_icon(32))
+        self.setStyleSheet(DARK_THEME_QSS)
         self.resize(780, 620)
         self._build_ui()
         self.refresh_data()

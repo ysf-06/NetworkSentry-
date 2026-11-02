@@ -195,3 +195,109 @@ def test_device_detail_dialog_save_and_ports_display(tmp_path: Path) -> None:
     assert updated.notes == "Lab Kubernetes Node"
     assert updated.is_trusted is True
     dlg.close()
+
+
+def test_cyber_guardian_dashboard_and_traffic_overview_widgets(tmp_path: Path) -> None:
+    """Verify Photo 1 (Cyber Guardian Dashboard) & Photo 2 (Traffic Overview) custom charts, NQL, and navigation."""
+    _get_qapp()
+    db = DatabaseManager(db_path=tmp_path / "cyber_ui.db")
+    cfg = ConfigManager(tmp_path / "config.json")
+
+    dev = DeviceRecord(
+        mac="00:1A:2B:3C:4D:5E",
+        ip="192.168.1.10",
+        hostname="core-switch",
+        vendor="Cisco Systems",
+        is_online=True,
+        is_trusted=True,
+    )
+    db.upsert_device(dev)
+    db.save_port_scan(PortScanRecord(mac=dev.mac, ip=dev.ip, port=22, service="ssh", banner="OpenSSH"))
+    db.save_port_scan(PortScanRecord(mac=dev.mac, ip=dev.ip, port=443, service="https", banner="TLS"))
+
+    win = MainWindow(config=cfg, db=db)
+    win.show()
+
+    # Verify all 5 top navigation pages exist and render cleanly
+    assert win.tabs.count() == 5
+    for page_idx in range(5):
+        win.switch_page(page_idx)
+        assert win.tabs.currentIndex() == page_idx
+        pix = win.grab()
+        assert not pix.isNull()
+
+    # Verify Photo 1 Dashboard widgets reflect database state
+    win.switch_page(0)
+    assert win.port_gauge.open_ports == 2
+    assert win.recent_scan_table.rowCount() >= 1
+    assert "SSH" in win.recent_scan_table.item(0, 1).text()
+
+    # Test timeline slider scrubbing & timeline window dropdown modes
+    win.timeline_slider.setValue(50)
+    assert len(win.packet_flow_chart._samples) >= 8
+    win.timeline_slider.setValue(100)
+
+    win.combo_timeline_window.setCurrentText("Last 15m")
+    assert len(win.packet_flow_chart._samples) == 12
+    win.combo_timeline_window.setCurrentText("Live Timeline")
+    assert len(win.packet_flow_chart._samples) >= 24
+
+    # Verify Top Protocols always sum to 100%
+    assert sum(pct for _, pct in win.top_protocols_chart._protocols) == 100
+
+    # Test Photo 2 Analyze page NQL filtering (including compound boolean & relational operators)
+    win.switch_page(2)
+    win.nql_input.setText("proto == udp")
+    win._update_telemetry_views()
+    assert win.proto_breakdown_bar._segments[1][0] == "udp"
+    assert win.proto_breakdown_bar._segments[1][1] == 60.0
+    assert sum(pct for _, pct in win.top_protocols_chart._protocols) == 100
+
+    win.nql_input.setText("port == 22")
+    win._update_telemetry_views()
+    assert win.port_gauge.open_ports == 1
+
+    # Compound relational NQL query (ports 22 and 443 exist in DB)
+    db.save_port_scan(PortScanRecord(mac=dev.mac, ip=dev.ip, port=80, service="http", banner="nginx"))
+    win.nql_input.setText("srcport >= 80 AND dstport != 443 && proto == tcp")
+    win._update_telemetry_views()
+    assert win.port_gauge.open_ports == 1  # matches port 80, excludes 22 (<80) and 443 (!=443)
+
+    win.nql_input.setText("dstip == 192.168.1.0/24 AND service != ssh")
+    win._update_telemetry_views()
+    assert win.port_gauge.open_ports == 2  # matches 80 and 443, excludes ssh (22)
+
+    win.nql_input.setText("")
+    win._update_telemetry_views()
+    assert win.port_gauge.open_ports == 3
+
+    # Test Analyze Metric selector ("bitrate", "packets", "flows")
+    for metric_name in ("packets", "flows", "bitrate"):
+        win.combo_analyze_metric.setCurrentText(metric_name)
+        assert len(win.flows_spiral._intensities) == 96
+
+    # Test synchronized hover across all 6 TelemetryAreaCharts
+    win._on_telemetry_hover_changed(0.35)
+    for ch in win._telemetry_charts:
+        assert ch._hover_ratio == 0.35
+
+    # Test compact laptop resolution resize (1024x600) & QPainter render pass
+    win.resize(1024, 600)
+    for widget in (
+        win.port_gauge,
+        win.packet_flow_chart,
+        win.top_protocols_chart,
+        win.flows_spiral,
+        win.proto_breakdown_bar,
+        win.port_breakdown_bar,
+        win.tcp_flag_widget,
+        win.timeline_slider,
+        *win._telemetry_charts,
+    ):
+        shot = widget.grab()
+        assert not shot.isNull()
+
+    win._on_telemetry_hover_changed(None)
+    win.close()
+
+
