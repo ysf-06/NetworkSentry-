@@ -37,3 +37,4 @@ def test_get_default_gateways_returns_dict() -> None:
         ipaddress.IPv4Address(gw_ip)
         if key != "*":
             ipaddress.IPv4Address(key)
+

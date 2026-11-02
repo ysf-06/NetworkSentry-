@@ -59,3 +59,4 @@ class ConfigManager:
     def get(self, section: str, key: str, default: Any = None) -> Any:
         """Retrieve a specific setting by section and key."""
         return self.data.get(section, {}).get(key, default)
+

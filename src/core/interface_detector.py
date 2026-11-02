@@ -172,3 +172,4 @@ class InterfaceDetector:
                     return iface
 
         return interfaces[0]
+

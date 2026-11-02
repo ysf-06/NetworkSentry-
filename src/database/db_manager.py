@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.database.models import (
+    DeviceHistoryRecord,
     DeviceRecord,
     PortScanRecord,
     ScanSessionRecord,
@@ -228,16 +229,58 @@ class DatabaseManager:
     def mark_offline_devices(self, active_macs: List[str]) -> int:
         """Mark devices not in `active_macs` as offline. Returns number of devices marked offline."""
         norm_macs = [m.upper().strip() for m in active_macs]
+        now = datetime.now().isoformat(timespec="seconds")
         with self._lock, self._get_connection() as conn:
             if not norm_macs:
+                going_offline = conn.execute(
+                    "SELECT mac, ip FROM devices WHERE is_online = 1"
+                ).fetchall()
                 cursor = conn.execute("UPDATE devices SET is_online = 0 WHERE is_online = 1")
-                return cursor.rowcount
-            placeholders = ",".join("?" for _ in norm_macs)
-            cursor = conn.execute(
-                f"UPDATE devices SET is_online = 0 WHERE is_online = 1 AND mac NOT IN ({placeholders})",
-                norm_macs,
-            )
+            else:
+                placeholders = ",".join("?" for _ in norm_macs)
+                going_offline = conn.execute(
+                    f"SELECT mac, ip FROM devices WHERE is_online = 1 AND mac NOT IN ({placeholders})",
+                    norm_macs,
+                ).fetchall()
+                cursor = conn.execute(
+                    f"UPDATE devices SET is_online = 0 WHERE is_online = 1 AND mac NOT IN ({placeholders})",
+                    norm_macs,
+                )
+            for row in going_offline:
+                conn.execute(
+                    """
+                    INSERT INTO device_history (mac, ip, event_type, timestamp, details)
+                    VALUES (?, ?, 'OFFLINE', ?, 'Device went offline')
+                    """,
+                    (row["mac"], row["ip"], now),
+                )
             return cursor.rowcount
+
+    def get_device_history(self, mac: Optional[str] = None, limit: int = 100) -> List[DeviceHistoryRecord]:
+        """Retrieve historical events for a specific device or across all devices."""
+        with self._lock, self._get_connection() as conn:
+            if mac:
+                norm_mac = mac.upper().strip()
+                rows = conn.execute(
+                    "SELECT * FROM device_history WHERE mac = ? ORDER BY id DESC LIMIT ?",
+                    (norm_mac, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM device_history ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [
+                DeviceHistoryRecord(
+                    id=r["id"],
+                    mac=r["mac"],
+                    ip=r["ip"],
+                    event_type=r["event_type"],
+                    timestamp=r["timestamp"],
+                    details=r["details"] or "",
+                )
+                for r in rows
+            ]
 
     def set_device_trusted(self, mac: str, trusted: bool) -> None:
         """Mark or unmark a device as trusted."""
@@ -247,6 +290,21 @@ class DatabaseManager:
                 "UPDATE devices SET is_trusted = ? WHERE mac = ?",
                 (1 if trusted else 0, norm_mac),
             )
+
+    def update_device_notes(self, mac: str, notes: str, hostname: Optional[str] = None) -> None:
+        """Update custom notes and optionally hostname for a device."""
+        norm_mac = mac.upper().strip()
+        with self._lock, self._get_connection() as conn:
+            if hostname is not None:
+                conn.execute(
+                    "UPDATE devices SET notes = ?, hostname = ? WHERE mac = ?",
+                    (notes, hostname, norm_mac),
+                )
+            else:
+                conn.execute(
+                    "UPDATE devices SET notes = ? WHERE mac = ?",
+                    (notes, norm_mac),
+                )
 
     def update_device_risk(self, mac: str, risk_level: str, risk_score: int) -> None:
         """Update the risk level and score of a device."""
@@ -278,12 +336,23 @@ class DatabaseManager:
             )
             return int(cursor.lastrowid)
 
+    def resolve_alert(self, alert_id: int) -> None:
+        """Mark a specific security alert as resolved."""
+        with self._lock, self._get_connection() as conn:
+            conn.execute("UPDATE security_alerts SET is_resolved = 1 WHERE id = ?", (alert_id,))
+
+    def resolve_all_alerts(self) -> int:
+        """Mark all unresolved security alerts as resolved."""
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute("UPDATE security_alerts SET is_resolved = 1 WHERE is_resolved = 0")
+            return cursor.rowcount
+
     def get_alerts(self, limit: int = 100, unresolved_only: bool = False) -> List[SecurityAlertRecord]:
         """Retrieve recent security alerts."""
         query = "SELECT * FROM security_alerts"
         if unresolved_only:
             query += " WHERE is_resolved = 0"
-        query += " ORDER BY timestamp DESC LIMIT ?"
+        query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
         with self._lock, self._get_connection() as conn:
             rows = conn.execute(query, (limit,)).fetchall()
             return [
@@ -424,3 +493,4 @@ class DatabaseManager:
             risk_score=int(row["risk_score"]),
             notes=row["notes"] or "",
         )
+

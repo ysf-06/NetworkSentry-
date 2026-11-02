@@ -133,3 +133,4 @@ def test_alerts_and_port_scans_and_sessions(tmp_path: Path) -> None:
         )
     )
     db.finish_scan_session(session_id, devices_found=5, new_devices=2, alerts_triggered=1)
+

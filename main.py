@@ -1,28 +1,35 @@
-"""Network Sentry — Main Entry Point & Phase 1 Diagnostic CLI."""
+"""Network Sentry — Main Entry Point (PySide6 Desktop GUI & CLI Modes)."""
 
 import argparse
 import socket
 import sys
 from typing import Optional
 
+from src.core.arp_scanner import ARPScanner
 from src.core.interface_detector import InterfaceDetector
 from src.database.db_manager import DatabaseManager
 from src.database.models import DeviceRecord
+from src.native.c_bridge import NativePacketEngine
+from src.security.arp_spoof_detector import ARPSpoofDetector
+from src.security.port_scanner import PortScanner
+from src.security.risk_engine import RiskEngine
 from src.utils.config import ConfigManager
 from src.utils.logger import setup_logger
+from src.utils.oui_lookup import OUILookup
+from src.utils.reporter import ReportExporter
 
 
-def run_phase1_diagnostics(config_path: str = "config.json") -> int:
-    """Execute Phase 1 foundation checks: Config, Interface Detection, and SQLite WAL DB."""
+def run_diagnostics(config_path: str = "config.json") -> int:
+    """Execute system diagnostics: Interface Detection, SQLite WAL DB, OUI DB, and Native C Engine."""
     cfg = ConfigManager(config_path)
     logger = setup_logger(
         "NetworkSentry",
         log_file=cfg.get("logging", "file", "networksentry.log"),
     )
 
-    print("=" * 72)
-    print("  NETWORK SENTRY — Phase 1: Project Foundation Diagnostic")
-    print("=" * 72)
+    print("=" * 74)
+    print("  NETWORK SENTRY v1.0.0 — System & Security Engine Diagnostics")
+    print("=" * 74)
 
     # 1. Detect Network Interfaces
     interfaces = InterfaceDetector.list_interfaces(include_loopback=False)
@@ -46,8 +53,6 @@ def run_phase1_diagnostics(config_path: str = "config.json") -> int:
             active.cidr,
             active.gateway_ip,
         )
-    else:
-        logger.warning("No active non-loopback IPv4 interface detected.")
 
     # 2. Initialize & Verify SQLite Database
     db_path = cfg.get("database", "path", "networksentry.db")
@@ -61,50 +66,162 @@ def run_phase1_diagnostics(config_path: str = "config.json") -> int:
     print(f"  Tables       : {', '.join(health['tables'])}")
     print(f"  Health Check : {'PASSED' if health['is_healthy'] else 'FAILED'}")
 
-    # 3. Register Local Host in Database if active interface exists
+    # 3. OUI Database & Native C Packet Engine
+    oui = OUILookup()
+    c_engine = NativePacketEngine(auto_compile=True)
+    print("\n[3] Discovery & Native C Engine Status:")
+    print(f"  OUI Database : {oui.count} vendor prefixes loaded")
+    print(f"  C Engine     : {'ACTIVE' if c_engine.is_native_loaded else 'FALLBACK'} ({c_engine.version()})")
+    print(f"  Npcap/libpcap: {'AVAILABLE' if c_engine.is_pcap_available() else 'NOT DETECTED (SendARP Active)'}")
+
+    # 4. Register Local Host in Database if active interface exists
     if active and active.mac_address != "00:00:00:00:00:00":
         local_device = DeviceRecord(
             mac=active.mac_address,
             ip=active.ip_address,
             hostname=socket.gethostname(),
-            vendor="Local Host (This PC)",
+            vendor=oui.lookup(active.mac_address)
+            if oui.lookup(active.mac_address) != "Unknown Vendor"
+            else "Local Host (This PC)",
             is_online=True,
             is_trusted=True,
             risk_level="LOW",
             risk_score=0,
             notes=f"Primary interface: {active.name}",
         )
-        is_new, _ = db.upsert_device(local_device)
-        logger.info(
-            "Local host device (%s / %s) registered in SQLite (is_new=%s).",
-            local_device.ip,
-            local_device.mac,
-            is_new,
-        )
+        db.upsert_device(local_device)
 
     stats = db.get_dashboard_stats()
-    print("\n[3] Current Database Summary:")
+    print("\n[4] Current Database Summary:")
     print(
         f"  Total Devices: {stats['total_devices']} | "
         f"Online: {stats['online_devices']} | "
         f"Trusted: {stats['trusted_devices']} | "
         f"Unresolved Alerts: {stats['unresolved_alerts']}"
     )
-    print("=" * 72)
+    print("=" * 74)
     return 0 if health["is_healthy"] else 1
+
+
+def run_cli_scan(
+    config_path: str = "config.json",
+    export_csv: Optional[str] = None,
+    export_json: Optional[str] = None,
+) -> int:
+    """Execute a full CLI network discovery & security scan."""
+    cfg = ConfigManager(config_path)
+    db = DatabaseManager(
+        db_path=cfg.get("database", "path", "networksentry.db"),
+        wal_mode=bool(cfg.get("database", "wal_mode", True)),
+    )
+    active = InterfaceDetector.get_active_interface(cfg.get("network", "preferred_interface"))
+    if not active:
+        print("[Error] No active IPv4 network interface detected.")
+        return 1
+
+    print(f"[*] Scanning subnet {active.cidr} on interface '{active.name}' (GW: {active.gateway_ip})...")
+    scanner = ARPScanner()
+    spoof_detector = ARPSpoofDetector(lock_gateway_mac=bool(cfg.get("security", "lock_gateway_mac", True)))
+    port_scanner = PortScanner(timeout=0.35, max_workers=24)
+    risk_engine = RiskEngine()
+
+    result = scanner.scan_and_sync(
+        interface=active,
+        db=db,
+        alert_on_new_device=bool(cfg.get("security", "alert_on_new_device", True)),
+    )
+    spoof_detector.analyze_scan(
+        ip_to_macs=result.ip_to_macs,
+        devices=result.discovered_devices,
+        gateway_ip=active.gateway_ip,
+        db=db,
+    )
+
+    common_ports = cfg.get("network", "common_ports", [21, 22, 23, 80, 443, 445, 3389, 8080])
+    unresolved = db.get_alerts(unresolved_only=True)
+    for dev in result.discovered_devices:
+        ports = port_scanner.scan_host(dev.ip, mac=dev.mac, ports=common_ports, db=db)
+        risk_engine.evaluate_device(dev, open_ports=ports, active_alerts=unresolved, db=db)
+
+    devices = db.get_all_devices(online_only=True)
+    print(f"\n[+] Discovered {len(devices)} Online Device(s) in {result.duration_seconds:.2f}s:")
+    print("-" * 92)
+    print(f"{'IP Address':<16} {'MAC Address':<19} {'Risk':<14} {'Hostname':<18} {'Vendor'}")
+    print("-" * 92)
+    for d in devices:
+        risk_str = f"{d.risk_level} ({d.risk_score})"
+        print(f"{d.ip:<16} {d.mac:<19} {risk_str:<14} {d.hostname[:17]:<18} {d.vendor}")
+    print("-" * 92)
+
+    if export_csv:
+        out_csv = ReportExporter.export_devices_csv(db.get_all_devices(), export_csv)
+        print(f"[+] Exported CSV report to: {out_csv}")
+    if export_json:
+        out_json = ReportExporter.export_full_report_json(db, export_json, interface=active)
+        print(f"[+] Exported JSON report to: {out_json}")
+
+    return 0
+
+
+def run_gui(config_path: str = "config.json") -> int:
+    """Launch the PySide6 Desktop Application."""
+    from PySide6.QtWidgets import QApplication
+    from src.gui.main_window import MainWindow
+
+    cfg = ConfigManager(config_path)
+    setup_logger("NetworkSentry", log_file=cfg.get("logging", "file", "networksentry.log"))
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("Network Sentry")
+    app.setOrganizationName("NetworkSentry")
+
+    window = MainWindow(config=cfg)
+    window.show()
+    return app.exec()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Network Sentry — Local Network Discovery & Security Monitor"
+        description="Network Sentry — Local Network Discovery, C Packet Engine & Security Monitor"
     )
     parser.add_argument(
         "--config",
         default="config.json",
         help="Path to configuration file (default: config.json)",
     )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Run system, database, and Native C Engine diagnostics and exit",
+    )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="Run a single CLI network discovery and security scan and exit",
+    )
+    parser.add_argument(
+        "--export-csv",
+        default=None,
+        help="Export device list to CSV path (used with --scan)",
+    )
+    parser.add_argument(
+        "--export-json",
+        default=None,
+        help="Export full security audit report to JSON path (used with --scan)",
+    )
     args = parser.parse_args()
-    sys.exit(run_phase1_diagnostics(config_path=args.config))
+
+    if args.diagnostics:
+        sys.exit(run_diagnostics(config_path=args.config))
+    if args.scan:
+        sys.exit(
+            run_cli_scan(
+                config_path=args.config,
+                export_csv=args.export_csv,
+                export_json=args.export_json,
+            )
+        )
+    sys.exit(run_gui(config_path=args.config))
 
 
 if __name__ == "__main__":

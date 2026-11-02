@@ -1,36 +1,17 @@
-# Virtual Environment
-.venv/
-venv/
-ENV/
-
-# Python Bytecode & Cache
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Database & Runtime State
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-config.json
-
-# Logs
-*.log
-logs/
-
-# Native C Build Artifacts
-*.dll
 *.so
-*.dylib
+*.dll
+*.exe
 *.o
 *.obj
-*.exp
-*.lib
+
+# Virtual environments
+.venv/
+venv/
+env/
 
 # Packaging & Distribution
 build/
@@ -38,8 +19,14 @@ dist/
 *.spec
 *.egg-info/
 
-# IDE & OS
+# Runtime Databases & Logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+config.json
+
+# Pytest & IDE
+.pytest_cache/
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db

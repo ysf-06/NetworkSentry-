@@ -80,3 +80,17 @@ class ScanSessionRecord:
     started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     finished_at: Optional[str] = None
     id: Optional[int] = None
+
+
+@dataclass
+class DeviceHistoryRecord:
+    """Represents a historical state transition event for a device."""
+
+    mac: str
+    ip: str
+    event_type: str  # FIRST_SEEN, IP_CHANGED, RECONNECTED, OFFLINE
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    details: str = ""
+    id: Optional[int] = None
+
+
