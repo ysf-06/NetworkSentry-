@@ -90,6 +90,21 @@ class OUILookup:
         return len(norm) == 17 and norm != "00:00:00:00:00:00"
 
     @classmethod
+    def extract_oui(cls, mac: str) -> str:
+        """Extract normalized 3-octet OUI prefix (e.g. 'AA:BB:CC')."""
+        norm = cls.normalize_mac(mac)
+        return norm[:8] if len(norm) >= 8 else ""
+
+    @classmethod
+    def is_locally_administered(cls, mac: str) -> bool:
+        """Return True if the MAC has the IEEE 802 Locally Administered Address (LAA) bit set."""
+        norm = cls.normalize_mac(mac)
+        if not norm:
+            return False
+        first_byte = int(norm[:2], 16)
+        return (first_byte & 0x02) != 0
+
+    @classmethod
     def is_randomized_mac(cls, mac: str) -> bool:
         """
         Return True if the MAC address has the Locally Administered Address (LAA) bit set
@@ -103,9 +118,9 @@ class OUILookup:
         if prefix in KNOWN_VIRTUAL_LAA_PREFIXES:
             return False
         first_byte = int(norm[:2], 16)
-        is_locally_administered = (first_byte & 0x02) != 0
+        is_laa = (first_byte & 0x02) != 0
         is_unicast = (first_byte & 0x01) == 0
-        return is_locally_administered and is_unicast
+        return is_laa and is_unicast
 
     def lookup(self, mac: str) -> str:
         """Resolve a MAC address to its manufacturer or address category."""

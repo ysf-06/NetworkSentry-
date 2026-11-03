@@ -3,9 +3,10 @@
 import errno
 import select
 import socket
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from src.database.db_manager import DatabaseManager
 from src.database.models import PortScanRecord
@@ -64,10 +65,12 @@ class PortScanner:
         timeout: float = 0.45,
         max_workers: int = 32,
         grab_banners: bool = True,
+        rate_limit_delay_ms: float = 0.0,
     ) -> None:
         self.timeout = max(0.05, float(timeout))
         self.max_workers = max(2, min(max_workers, 128))
         self.grab_banners = grab_banners
+        self.rate_limit_delay_ms = max(0.0, float(rate_limit_delay_ms))
 
     @staticmethod
     def get_service_name(port: int) -> str:
@@ -86,6 +89,8 @@ class PortScanner:
         Logs any non-zero errno or OSError code at DEBUG level for diagnostics.
         """
         target_port = int(port)
+        if self.rate_limit_delay_ms > 0:
+            time.sleep(self.rate_limit_delay_ms / 1000.0)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.timeout)
@@ -202,3 +207,125 @@ class PortScanner:
             )
 
         return open_records
+
+    @classmethod
+    def run_localhost_verification(
+        cls,
+        banner_text: str = "SSH-2.0-NetworkSentryTest",
+        port: Optional[int] = None,
+        timeout: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Self-contained localhost port verification test mode.
+        Spins up a temporary ephemeral local TCP socket, probes it using PortScanner,
+        confirms detection, verifies negative check on a closed port, and cleans up.
+        Returns a dictionary containing test results and diagnostic details.
+        """
+        import threading
+        import time
+
+        server_sock: Optional[socket.socket] = None
+        listener_ready = threading.Event()
+        shutdown_event = threading.Event()
+        server_error: List[str] = []
+
+        target_port = int(port) if port is not None and port > 0 else 0
+
+        try:
+            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_sock.bind(("127.0.0.1", target_port))
+            server_sock.listen(1)
+            actual_open_port = server_sock.getsockname()[1]
+        except OSError as exc:
+            if server_sock:
+                server_sock.close()
+            return {
+                "success": False,
+                "open_port": target_port,
+                "closed_port": None,
+                "detected": False,
+                "banner_matched": False,
+                "negative_check_passed": False,
+                "message": f"Failed to bind ephemeral server socket on 127.0.0.1:{target_port}: {exc}",
+            }
+
+        def _serve() -> None:
+            listener_ready.set()
+            try:
+                server_sock.settimeout(2.5)
+                conn, _ = server_sock.accept()
+                with conn:
+                    if banner_text:
+                        conn.sendall(f"{banner_text}\r\n".encode("utf-8"))
+                    time.sleep(0.05)
+            except OSError as e:
+                if not shutdown_event.is_set():
+                    server_error.append(str(e))
+
+        th = threading.Thread(target=_serve, daemon=True)
+        th.start()
+        listener_ready.wait(timeout=1.5)
+
+        # Find a port that is definitely closed
+        closed_port = None
+        for cand in [actual_open_port + 1, actual_open_port + 3, actual_open_port + 7, (actual_open_port + 100) % 60000 + 1024]:
+            if cand > 65535 or cand == actual_open_port:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.08)
+                    if probe.connect_ex(("127.0.0.1", cand)) != 0:
+                        closed_port = cand
+                        break
+            except OSError:
+                closed_port = cand
+                break
+        if closed_port is None:
+            closed_port = 65432
+
+        scanner = cls(timeout=timeout, grab_banners=bool(banner_text))
+        t0 = time.monotonic()
+        open_record = scanner.probe_port("127.0.0.1", actual_open_port)
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        closed_record = scanner.probe_port("127.0.0.1", closed_port)
+
+        shutdown_event.set()
+        try:
+            server_sock.close()
+        except OSError:
+            pass
+        th.join(timeout=1.0)
+
+        detected = open_record is not None and open_record.state == "OPEN"
+        banner_matched = bool(open_record and banner_text and banner_text in open_record.banner) if banner_text else True
+        negative_passed = closed_record is None
+
+        success = detected and negative_passed and banner_matched
+
+        msg = (
+            f"Localhost Port Verification PASSED: Open port {actual_open_port} detected in {elapsed_ms:.1f}ms "
+            f"(Banner: '{open_record.banner if open_record else ''}'), closed port {closed_port} correctly rejected."
+            if success
+            else f"Localhost Port Verification FAILED: detected={detected}, negative_check={negative_passed}, errors={server_error}"
+        )
+
+        return {
+            "success": success,
+            "host": "127.0.0.1",
+            "port": actual_open_port,
+            "open_port": actual_open_port,
+            "closed_port": closed_port,
+            "detected": detected,
+            "state": "OPEN" if detected else "CLOSED",
+            "service": open_record.service if open_record else "unknown",
+            "banner": open_record.banner if open_record else "",
+            "banner_matched": banner_matched,
+            "negative_check_passed": negative_passed,
+            "elapsed_ms": round(elapsed_ms, 2),
+            "record": open_record,
+            "message": msg,
+            "error": None if success else msg,
+        }
+

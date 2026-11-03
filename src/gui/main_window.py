@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import socket
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon
+from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -25,13 +29,12 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QStatusBar,
-    QTabWidget,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
-    QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -86,12 +89,27 @@ class DiscoveryScanWorker(QThread):
         alert_on_new_device: bool = True,
         auto_port_scan_new: bool = True,
         common_ports: Optional[List[int]] = None,
+        override_cidr: Optional[str] = None,
+        custom_workers: Optional[int] = None,
+        custom_rate_pps: Optional[int] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.interface = interface
+        if override_cidr and "/" in override_cidr:
+            try:
+                self.interface = dataclasses.replace(interface, cidr=override_cidr)
+            except Exception:
+                self.interface = interface
+        else:
+            self.interface = interface
         self.db = db
         self.arp_scanner = arp_scanner
+        if custom_workers and custom_workers > 0:
+            self.arp_scanner.max_workers = custom_workers
+        if custom_rate_pps and custom_rate_pps > 0:
+            delay_ms = 1000.0 / float(custom_rate_pps)
+            self.arp_scanner.rate_limit_delay_ms = delay_ms
+            port_scanner.rate_limit_delay_ms = delay_ms
         self.spoof_detector = spoof_detector
         self.port_scanner = port_scanner
         self.risk_engine = risk_engine
@@ -194,6 +212,7 @@ class MainWindow(QMainWindow):
         self._nav_buttons: List[QPushButton] = []
         self._side_buttons: List[QPushButton] = []
         self._telemetry_charts: List[TelemetryAreaChart] = []
+        self.timeline_slider: TimelineScrubberSlider
 
         self.setWindowTitle("CYBER GUARDIAN | Network Port Scanner & Packet Analyzer")
         self.setWindowIcon(create_cyber_guardian_icon(64))
@@ -203,6 +222,11 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_tray_icon()
         self._setup_timers()
+        if self.active_interface:
+            self.traffic_monitor.start_live_pcap(
+                interface_name=self.active_interface.name,
+                interface_ip=self.active_interface.ip_address,
+            )
         self.refresh_all_views()
 
     def _ensure_local_host_seeded(self) -> None:
@@ -397,7 +421,20 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
         self.status_bar.showMessage("Ready. Click 'Start Scan' to discover active devices and analyze ports.")
 
+        # Check for first-run authorization consent (deferred timer for interactive users)
+        if not bool(self.cfg.get("security", "authorized_network_consent", False)):
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                QTimer.singleShot(250, self._show_consent_dialog)
+
+        # Start live passive wire capture on active interface if available
+        if self.active_interface:
+            self.traffic_monitor.start_live_pcap(
+                interface_name=self.active_interface.name,
+                interface_ip=self.active_interface.ip_address,
+            )
+
     def switch_page(self, index: int) -> None:
+
         """Switch active page across TopNavBar, LeftSidebar, and QTabWidget."""
         if 0 <= index < self.tabs.count():
             self.tabs.setCurrentIndex(index)
@@ -819,8 +856,65 @@ class MainWindow(QMainWindow):
 
         dev_layout.addLayout(cards_layout)
 
+        # Visible Scan Parameters & Target CIDR Configuration
+        cfg_bar = QFrame()
+        cfg_bar.setObjectName("CyberCard")
+        cfg_bar_lay = QHBoxLayout(cfg_bar)
+        cfg_bar_lay.setContentsMargins(12, 6, 12, 6)
+        cfg_bar_lay.setSpacing(10)
+
+        lbl_cidr = QLabel("Target Subnet:")
+        lbl_cidr.setStyleSheet("color: #94A3B8; font-weight: 700;")
+        cfg_bar_lay.addWidget(lbl_cidr)
+
+        self.edit_target_cidr = QLineEdit()
+        self.edit_target_cidr.setPlaceholderText(
+            self.active_interface.cidr if self.active_interface else "192.168.1.0/24"
+        )
+        self.edit_target_cidr.setText(self.active_interface.cidr if self.active_interface else "")
+        self.edit_target_cidr.setMaximumWidth(160)
+        cfg_bar_lay.addWidget(self.edit_target_cidr)
+
+        lbl_workers = QLabel("Workers:")
+        lbl_workers.setStyleSheet("color: #94A3B8; font-weight: 700;")
+        cfg_bar_lay.addWidget(lbl_workers)
+
+        self.spin_max_workers = QSpinBox()
+        self.spin_max_workers.setRange(2, 64)
+        self.spin_max_workers.setValue(int(self.cfg.get("network", "max_workers", 24)))
+        self.spin_max_workers.setMaximumWidth(60)
+        cfg_bar_lay.addWidget(self.spin_max_workers)
+
+        lbl_rate = QLabel("Rate (pps):")
+        lbl_rate.setStyleSheet("color: #94A3B8; font-weight: 700;")
+        cfg_bar_lay.addWidget(lbl_rate)
+
+        self.spin_rate_limit = QSpinBox()
+        self.spin_rate_limit.setRange(5, 500)
+        self.spin_rate_limit.setValue(int(self.cfg.get("network", "rate_limit_pps", 100)))
+        self.spin_rate_limit.setToolTip("Maximum outgoing probe packets per second (rate limit) to avoid flooding")
+        self.spin_rate_limit.setMaximumWidth(65)
+        cfg_bar_lay.addWidget(self.spin_rate_limit)
+
+        lbl_ports = QLabel("Ports:")
+        lbl_ports.setStyleSheet("color: #94A3B8; font-weight: 700;")
+        cfg_bar_lay.addWidget(lbl_ports)
+
+        common_p = self.cfg.get("network", "common_ports", [21, 22, 23, 80, 135, 139, 443, 445, 3389, 8080])
+        self.edit_scan_ports = QLineEdit(", ".join(str(p) for p in common_p))
+        self.edit_scan_ports.setToolTip("Comma-separated TCP ports to probe on discovered hosts")
+        cfg_bar_lay.addWidget(self.edit_scan_ports, stretch=1)
+
+        self.btn_localhost_verify = QPushButton("Verify Localhost")
+        self.btn_localhost_verify.setToolTip("Run safe ephemeral localhost TCP test to verify scanner without touching real network")
+        self.btn_localhost_verify.clicked.connect(self.run_localhost_port_test)
+        cfg_bar_lay.addWidget(self.btn_localhost_verify)
+
+        dev_layout.addWidget(cfg_bar)
+
         # Filter & Action Bar
         filter_row = QHBoxLayout()
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
             "Search devices by IP, MAC address, Vendor (Apple, Espressif...), or Hostname..."
@@ -1141,6 +1235,14 @@ class MainWindow(QMainWindow):
         alert_actions.addWidget(self.chk_unresolved_only)
         alert_actions.addStretch()
 
+        self.btn_approve_expected = QPushButton("Approve Expected Change")
+        self.btn_approve_expected.setObjectName("SuccessButton")
+        self.btn_approve_expected.setToolTip(
+            "Acknowledge and mark MAC/IP transition as trusted/expected (e.g. router reboot, mesh Wi-Fi AP, DHCP lease)"
+        )
+        self.btn_approve_expected.clicked.connect(self.approve_selected_alert_change)
+        alert_actions.addWidget(self.btn_approve_expected)
+
         self.btn_resolve_selected = QPushButton("Mark Selected Resolved")
         self.btn_resolve_selected.clicked.connect(self.resolve_selected_alert)
         alert_actions.addWidget(self.btn_resolve_selected)
@@ -1152,16 +1254,17 @@ class MainWindow(QMainWindow):
 
         logs_layout.addLayout(alert_actions)
 
-        self.alerts_table = QTableWidget(0, 7)
+        self.alerts_table = QTableWidget(0, 10)
         self.alerts_table.setHorizontalHeaderLabels(
-            ["ID", "Timestamp", "Severity", "Alert Type", "IP Address", "MAC Address", "Description"]
+            ["ID", "Timestamp", "Severity", "Confidence", "Alert Type", "IP Address", "MAC Address", "First Seen", "Last Changed", "Description"]
         )
         self.alerts_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.alerts_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.alerts_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
         self.alerts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.alerts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.alerts_table.setAlternatingRowColors(True)
         logs_layout.addWidget(self.alerts_table, stretch=3)
+
 
         lbl_hist_hdr = QLabel("Device State History Timeline (First Seen / IP Changes / Reconnections)")
         lbl_hist_hdr.setObjectName("CardHeaderTitle")
@@ -1238,13 +1341,56 @@ class MainWindow(QMainWindow):
         self.btn_export_json = QPushButton("Export Full Security Audit JSON")
         self.btn_export_json.clicked.connect(lambda: self.export_json_report())
         exp_row.addWidget(self.btn_export_json)
+
+        self.btn_test_localhost_settings = QPushButton("Run Localhost Port Verification Test")
+        self.btn_test_localhost_settings.clicked.connect(self.run_localhost_port_test)
+        exp_row.addWidget(self.btn_test_localhost_settings)
         exp_row.addStretch()
-        form.addRow("Audit Reports:", exp_row)
+        form.addRow("Verification & Reports:", exp_row)
 
         slay.addWidget(card_cfg)
+
+        # Card 2: Persistent Data Management, Retention Policy & Full DB Backup
+        card_data = QFrame()
+        card_data.setObjectName("CyberCard")
+        data_form = QFormLayout(card_data)
+        data_form.setContentsMargins(20, 18, 20, 18)
+        data_form.setSpacing(12)
+
+        lbl_data_hdr = QLabel("Persistent Data Lifecycle & Database Retention")
+        lbl_data_hdr.setObjectName("CardHeaderTitle")
+        data_form.addRow(lbl_data_hdr)
+
+        ret_row = QHBoxLayout()
+        self.spin_retention_days = QSpinBox()
+        self.spin_retention_days.setRange(1, 365)
+        self.spin_retention_days.setValue(int(self.cfg.get("database", "retention_days", 30)))
+        self.spin_retention_days.setSuffix(" days")
+        ret_row.addWidget(self.spin_retention_days)
+
+        self.btn_prune_history = QPushButton("Prune Records Older Than Policy")
+        self.btn_prune_history.clicked.connect(self.prune_history_records)
+        ret_row.addWidget(self.btn_prune_history)
+        ret_row.addStretch()
+        data_form.addRow("History Retention Policy:", ret_row)
+
+        db_ops_row = QHBoxLayout()
+        self.btn_export_db_backup = QPushButton("Export Full Database JSON Backup")
+        self.btn_export_db_backup.clicked.connect(self.export_full_db_backup)
+        db_ops_row.addWidget(self.btn_export_db_backup)
+
+        self.btn_purge_db = QPushButton("Purge Stored Data (Clear DB)")
+        self.btn_purge_db.setObjectName("DangerButton")
+        self.btn_purge_db.clicked.connect(self.purge_all_stored_data)
+        db_ops_row.addWidget(self.btn_purge_db)
+        db_ops_row.addStretch()
+        data_form.addRow("Database Operations:", db_ops_row)
+
+        slay.addWidget(card_data)
         slay.addStretch()
 
         self.tabs.addTab(settings_tab, "Settings")
+
 
     # =========================================================================
     # SYSTEM TRAY, TIMERS & LIVE TELEMETRY UPDATES
@@ -1404,6 +1550,10 @@ class MainWindow(QMainWindow):
         if 0 <= index < len(self.interfaces):
             self.active_interface = self.interfaces[index]
             self.spoof_detector.reset_baseline()
+            self.traffic_monitor.start_live_pcap(
+                interface_name=self.active_interface.name,
+                interface_ip=self.active_interface.ip_address,
+            )
             self.status_bar.showMessage(
                 f"Switched active interface to {self.active_interface.name} ({self.active_interface.cidr})"
             )
@@ -1422,6 +1572,51 @@ class MainWindow(QMainWindow):
         if self.chk_auto_scan.isChecked():
             self.scan_timer.setInterval(seconds * 1000)
 
+    def _show_consent_dialog(self) -> bool:
+        """Display an explicit authorization confirmation modal before scanning any network."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Network Authorization Consent")
+        dlg.setFixedWidth(520)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(12)
+
+        lbl_hdr = QLabel("🛡  Network Scanner Authorization Consent")
+        lbl_hdr.setObjectName("CardHeaderTitle")
+        lbl_hdr.setStyleSheet("color: #F8FAFC; font-size: 15px; font-weight: 800;")
+        lay.addWidget(lbl_hdr)
+
+        lbl_text = QLabel(
+            "Cyber Guardian performs active ARP discovery and TCP port inspection across the local network.\n\n"
+            "• You must only scan networks and hosts that you own or have explicit written authorization to monitor.\n"
+            "• Unauthorized port scanning and network mapping may violate corporate policies, terms of service, or applicable law.\n"
+            "• By checking the confirmation box below, you acknowledge that you are authorized to scan the target subnet."
+        )
+        lbl_text.setWordWrap(True)
+        lbl_text.setStyleSheet("color: #CBD5E1; font-size: 12px; line-height: 1.4;")
+        lay.addWidget(lbl_text)
+
+        chk_consent = QCheckBox("I confirm that I own or have explicit authorization to monitor and scan this network.")
+        chk_consent.setStyleSheet("color: #38BDF8; font-weight: 700; font-size: 12px; padding-top: 8px;")
+        lay.addWidget(chk_consent)
+
+        btn_box = QDialogButtonBox()
+        btn_proceed = btn_box.addButton("Proceed with Scan", QDialogButtonBox.ButtonRole.AcceptRole)
+        btn_cancel = btn_box.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        btn_proceed.setEnabled(False)
+        btn_proceed.setObjectName("GoldScanButton")
+        btn_cancel.setObjectName("SecondaryButton")
+        chk_consent.toggled.connect(btn_proceed.setEnabled)
+
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        lay.addWidget(btn_box)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted and chk_consent.isChecked():
+            self.cfg.set("security", "authorized_network_consent", True)
+            self.cfg.save()
+            return True
+        return False
+
     def start_network_scan(self) -> None:
         """Launch an asynchronous ARP & Security scan on the active network interface."""
         if self._scan_worker is not None and self._scan_worker.isRunning():
@@ -1430,6 +1625,24 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("No active IPv4 network interface available.")
             return
 
+        if not bool(self.cfg.get("security", "authorized_network_consent", False)):
+            if not self._show_consent_dialog():
+                self.status_bar.showMessage("Scan cancelled: Authorization consent was not granted.")
+                return
+
+        override_cidr = self.edit_target_cidr.text().strip() or None
+        custom_workers = self.spin_max_workers.value()
+        custom_rate_pps = self.spin_rate_limit.value()
+        port_raw = self.edit_scan_ports.text().strip()
+        custom_ports: List[int] = []
+        for p in port_raw.split(","):
+            p_clean = p.strip()
+            if p_clean.isdigit():
+                custom_ports.append(int(p_clean))
+        if not custom_ports:
+            custom_ports = self.cfg.get("network", "common_ports", [21, 22, 23, 80, 135, 139, 443, 445, 3389, 8080])
+
+        target_display = override_cidr or self.active_interface.cidr
         self.btn_scan_now.setEnabled(False)
         self.btn_scan_now.setText("Scanning...")
         self.btn_scan_page_trigger.setEnabled(False)
@@ -1438,7 +1651,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.status_bar.showMessage(
-            f"Scanning subnet {self.active_interface.cidr} on {self.active_interface.name}..."
+            f"Scanning subnet {target_display} on {self.active_interface.name}..."
         )
 
         self._scan_worker = DiscoveryScanWorker(
@@ -1449,8 +1662,11 @@ class MainWindow(QMainWindow):
             port_scanner=self.port_scanner,
             risk_engine=self.risk_engine,
             alert_on_new_device=bool(self.cfg.get("security", "alert_on_new_device", True)),
-            auto_port_scan_new=bool(self.cfg.get("security", "auto_port_scan_new_devices", True)),
-            common_ports=self.cfg.get("network", "common_ports"),
+            auto_port_scan_new=bool(self.cfg.get("security", "auto_port_scan_new_devices", False)),
+            common_ports=custom_ports,
+            override_cidr=override_cidr,
+            custom_workers=custom_workers,
+            custom_rate_pps=custom_rate_pps,
             parent=self,
         )
         self._scan_worker.progress_updated.connect(self._on_scan_progress)
@@ -1648,8 +1864,10 @@ class MainWindow(QMainWindow):
         """Populate the 'Active Alerts' card on the Dashboard (Photo 1 bottom-center)."""
         while self.dash_alerts_vbox.count():
             child = self.dash_alerts_vbox.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            if child:
+                w = child.widget()
+                if w:
+                    w.deleteLater()
 
         alerts = self.db.get_alerts(limit=25, unresolved_only=True)
         f_mode = self.combo_dash_alert_filter.currentText()
@@ -1777,7 +1995,7 @@ class MainWindow(QMainWindow):
             self.devices_table.setItem(row_idx, 7, QTableWidgetItem(dev.last_seen))
 
     def refresh_alerts_table(self) -> None:
-        """Populate the security alerts feed table."""
+        """Populate the security alerts feed table with 8 columns including confidence badges."""
         unresolved_only = self.chk_unresolved_only.isChecked()
         alerts = self.db.get_alerts(limit=200, unresolved_only=unresolved_only)
         self.alerts_table.setRowCount(len(alerts))
@@ -1793,11 +2011,179 @@ class MainWindow(QMainWindow):
             sev_item.setForeground(QColor(sev_color))
             self.alerts_table.setItem(row_idx, 2, sev_item)
 
-            type_text = alert.alert_type + (" [RESOLVED]" if alert.is_resolved else "")
-            self.alerts_table.setItem(row_idx, 3, QTableWidgetItem(type_text))
-            self.alerts_table.setItem(row_idx, 4, QTableWidgetItem(alert.ip))
-            self.alerts_table.setItem(row_idx, 5, QTableWidgetItem(alert.mac))
-            self.alerts_table.setItem(row_idx, 6, QTableWidgetItem(alert.description))
+            conf_str = alert.confidence or "MEDIUM_CONFIDENCE"
+            if conf_str == "HIGH_CONFIDENCE":
+                conf_color = "#EF4444"
+                conf_display = "HIGH"
+            elif conf_str == "SUSPECTED_DHCP_OR_REBOOT":
+                conf_color = "#38BDF8"
+                conf_display = "SUSPECTED DHCP/REBOOT"
+            else:
+                conf_color = "#F59E0B"
+                conf_display = "MEDIUM"
+
+            conf_item = QTableWidgetItem(conf_display)
+            conf_item.setForeground(QColor(conf_color))
+            conf_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            self.alerts_table.setItem(row_idx, 3, conf_item)
+
+            if alert.is_acknowledged:
+                type_text = f"{alert.alert_type} [APPROVED]"
+            elif alert.is_resolved:
+                type_text = f"{alert.alert_type} [RESOLVED]"
+            else:
+                type_text = alert.alert_type
+            self.alerts_table.setItem(row_idx, 4, QTableWidgetItem(type_text))
+
+            self.alerts_table.setItem(row_idx, 5, QTableWidgetItem(alert.ip))
+            mac_item = QTableWidgetItem(alert.mac)
+            mac_item.setForeground(QColor("#FBBF24"))
+            self.alerts_table.setItem(row_idx, 6, mac_item)
+
+            first_seen_str = alert.first_seen or alert.timestamp
+            last_changed_str = alert.last_changed or alert.timestamp
+            self.alerts_table.setItem(row_idx, 7, QTableWidgetItem(first_seen_str))
+            self.alerts_table.setItem(row_idx, 8, QTableWidgetItem(last_changed_str))
+
+            desc = alert.description
+            if alert.acknowledgement_notes:
+                desc += f" (Approved: {alert.acknowledgement_notes})"
+            self.alerts_table.setItem(row_idx, 9, QTableWidgetItem(desc))
+
+    def approve_selected_alert_change(self) -> None:
+        """Approve and acknowledge a reported network transition as expected (e.g. router reboot/DHCP)."""
+        row = self.alerts_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select Alert", "Please select an alert from the table first.")
+            return
+        id_item = self.alerts_table.item(row, 0)
+        if not id_item:
+            return
+        alert_id = id_item.data(Qt.ItemDataRole.UserRole)
+        if alert_id is None:
+            return
+
+        all_alerts = self.db.get_alerts(limit=250, unresolved_only=False)
+        matched = [a for a in all_alerts if a.id == alert_id]
+        if not matched:
+            return
+        alert = matched[0]
+
+        notes, ok = QInputDialog.getText(
+            self,
+            "Approve Expected Change",
+            f"Approve expected network change for {alert.ip} ({alert.mac})?\n"
+            f"(e.g., 'Router reboot', 'Mesh AP handoff', 'Renewed DHCP lease'):",
+            text="Approved expected network change / verified equipment",
+        )
+        if not ok:
+            return
+
+        user_note = notes.strip() or "Approved by operator"
+        self.spoof_detector.approve_expected_change(
+            ip=alert.ip,
+            new_mac=alert.mac,
+            notes=user_note,
+            db=self.db,
+        )
+        self.db.acknowledge_alert(int(alert_id), notes=user_note)
+        self.db.resolve_alert(int(alert_id))
+        self._recalculate_all_device_risks()
+        self.refresh_all_views()
+        self.status_bar.showMessage(f"Approved and resolved alert #{alert_id} ({user_note}).")
+
+    def run_localhost_port_test(self) -> None:
+        """Execute safe ephemeral localhost TCP test to verify scanner without touching real network."""
+        self.status_bar.showMessage("Running localhost port verification test...")
+        try:
+            res = self.port_scanner.run_localhost_verification(
+                banner_text="CyberGuardian-Localhost-Verification",
+                timeout=0.8,
+            )
+            if res.get("success"):
+                rec = res.get("record")
+                target_port = res.get("open_port") or res.get("port")
+                target_host = res.get("host") or "127.0.0.1"
+                state_str = rec.state if rec else res.get("state", "OPEN")
+                svc_str = rec.service if rec else res.get("service", "tcp-echo")
+                banner_str = rec.banner if rec else res.get("banner", "")
+                elapsed = res.get("elapsed_ms", 0.0)
+
+                QMessageBox.information(
+                    self,
+                    "Localhost Verification Passed",
+                    f"✔ Localhost Port Scanner Verification Successful!\n\n"
+                    f"Target: {target_host}:{target_port} ({elapsed:.1f} ms)\n"
+                    f"State: {state_str}\n"
+                    f"Service: {svc_str}\n"
+                    f"Banner: {banner_str}\n\n"
+                    f"The socket scanner subsystem is operating normally without external network packets.",
+                )
+                self.status_bar.showMessage("Localhost port test PASSED.")
+            else:
+                err_msg = res.get("message") or res.get("error") or "Unknown localhost test error"
+                QMessageBox.warning(
+                    self,
+                    "Localhost Verification Failed",
+                    f"Localhost port test failed:\n{err_msg}",
+                )
+                self.status_bar.showMessage("Localhost port test FAILED.")
+        except Exception as exc:
+            logger.exception("Localhost port test error: %s", exc)
+            QMessageBox.critical(self, "Verification Error", f"Error during localhost test:\n{exc}")
+
+    def export_full_db_backup(self) -> None:
+        """Export full database records into a single JSON backup file."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Full Database JSON Backup",
+            "networksentry_db_backup.json",
+            "JSON Files (*.json)",
+        )
+        if not file_path:
+            return
+        try:
+            out_path = self.db.export_data_backup(file_path)
+            QMessageBox.information(
+                self,
+                "Backup Exported",
+                f"✔ Full database backup successfully saved to:\n{out_path}",
+            )
+            self.status_bar.showMessage(f"Database backup saved to {out_path}")
+        except Exception as exc:
+            logger.exception("Backup export failed: %s", exc)
+            QMessageBox.critical(self, "Backup Error", f"Failed to export database backup:\n{exc}")
+
+    def purge_all_stored_data(self) -> None:
+        """Completely clear all devices, ports, history and alerts after user confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Purge All Stored Data",
+            "Are you sure you want to completely purge all stored devices, history, alerts, and open ports from the database?\n\n"
+            "This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.db.clear_all_data()
+            self.spoof_detector.reset_baseline()
+            self._ensure_local_host_seeded()
+            self.refresh_all_views()
+            self.status_bar.showMessage("All stored database records have been purged.")
+            QMessageBox.information(self, "Data Purged", "Database cleared successfully.")
+
+    def prune_history_records(self) -> None:
+        """Prune historical timeline records older than the retention policy."""
+        days = self.spin_retention_days.value()
+        res = self.db.prune_old_records(retention_days=days)
+        total_pruned = sum(res.values())
+        self.refresh_all_views()
+        self.status_bar.showMessage(f"Pruned {total_pruned} historical record(s) older than {days} days.")
+        QMessageBox.information(
+            self,
+            "Retention Policy Applied",
+            f"Pruned {total_pruned} record(s) older than {days} days from device history and telemetry.",
+        )
 
     def refresh_history_table(self) -> None:
         """Populate the device history timeline table."""
@@ -1881,11 +2267,13 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Resolved {count} alert(s).")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        """Stop background timers, wait for active worker thread, and hide tray icon on exit."""
+        """Stop background timers, live pcap capture, active worker thread, and hide tray icon on exit."""
         if hasattr(self, "scan_timer"):
             self.scan_timer.stop()
         if hasattr(self, "telemetry_timer"):
             self.telemetry_timer.stop()
+        if hasattr(self, "traffic_monitor") and self.traffic_monitor:
+            self.traffic_monitor.stop_live_pcap()
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.wait(2500)
         if hasattr(self, "tray_icon") and self.tray_icon is not None:

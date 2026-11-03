@@ -7,6 +7,7 @@ import re
 import socket
 import struct
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,10 +50,12 @@ class ARPScanner:
         oui_lookup: Optional[OUILookup] = None,
         max_workers: int = 64,
         resolve_hostnames: bool = True,
+        rate_limit_delay_ms: float = 0.0,
     ) -> None:
         self.oui = oui_lookup or OUILookup()
         self.max_workers = max(4, min(max_workers, 256))
         self.resolve_hostnames = resolve_hostnames
+        self.rate_limit_delay_ms = max(0.0, float(rate_limit_delay_ms))
         self._is_windows = platform.system().lower() == "windows"
         self._iphlpapi = None
         if self._is_windows:
@@ -94,6 +97,8 @@ class ARPScanner:
         On Windows, uses `iphlpapi.SendARP`. On Linux/POSIX, triggers a fast UDP/ICMP probe
         and inspects the kernel neighbor table.
         """
+        if self.rate_limit_delay_ms > 0:
+            time.sleep(self.rate_limit_delay_ms / 1000.0)
         if self._is_windows and self._iphlpapi is not None:
             try:
                 dest_addr = ctypes.c_ulong(self._ip_to_net_ulong(target_ip))
@@ -268,10 +273,10 @@ class ARPScanner:
                     for ip in discovered_ips
                     if ip != interface.ip_address
                 }
-                for future in as_completed(hn_futures):
-                    ip = hn_futures[future]
+                for hn_fut in as_completed(hn_futures):
+                    ip = hn_futures[hn_fut]
                     try:
-                        ip_to_hostname[ip] = future.result()
+                        ip_to_hostname[ip] = hn_fut.result()
                     except Exception:
                         ip_to_hostname[ip] = "Unknown"
 

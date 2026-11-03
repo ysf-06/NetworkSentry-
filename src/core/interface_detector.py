@@ -162,18 +162,18 @@ class InterfaceDetector:
                         if via_match:
                             gw_ip = via_match.group(1)
                             metric = int(metric_match.group(1)) if metric_match else 100
-                            iface_ip: Optional[str] = None
+                            route_ip: Optional[str] = None
                             if src_match:
-                                iface_ip = src_match.group(1)
+                                route_ip = src_match.group(1)
                             elif dev_match and dev_match.group(1) in iface_ip_map:
-                                iface_ip = iface_ip_map[dev_match.group(1)]
-                            linux_routes.append((metric, iface_ip, gw_ip))
+                                route_ip = iface_ip_map[dev_match.group(1)]
+                            linux_routes.append((metric, route_ip, gw_ip))
                     linux_routes.sort(key=lambda item: item[0])
-                    for _, iface_ip, gw_ip in linux_routes:
+                    for _, r_ip, gw_ip in linux_routes:
                         if "*" not in gateways:
                             gateways["*"] = gw_ip
-                        if iface_ip:
-                            gateways.setdefault(iface_ip, gw_ip)
+                        if r_ip:
+                            gateways.setdefault(r_ip, gw_ip)
             except Exception as exc:
                 logger.debug("Linux ip route query failed (falling back to /proc/net/route): %s", exc)
 

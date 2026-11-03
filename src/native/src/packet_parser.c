@@ -267,5 +267,6 @@ NS_EXPORT int is_pcap_available(void) {
 }
 
 NS_EXPORT const char* packet_engine_version(void) {
-    return "NetworkSentry-NativeEngine/1.1.0";
+    return "NetworkSentry-NativeEngine/1.3.0";
 }
+

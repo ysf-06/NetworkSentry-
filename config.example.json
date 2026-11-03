@@ -1,12 +1,16 @@
 {
   "database": {
     "path": "networksentry.db",
-    "wal_mode": true
+    "wal_mode": true,
+    "retention_days": 30
   },
   "network": {
     "preferred_interface": null,
+    "target_cidr": null,
     "scan_interval_seconds": 30,
     "arp_timeout_ms": 1500,
+    "rate_limit_pps": 100,
+    "max_workers": 24,
     "common_ports": [
       21,
       22,
@@ -25,7 +29,9 @@
   "security": {
     "lock_gateway_mac": true,
     "alert_on_new_device": true,
-    "auto_port_scan_new_devices": true
+    "auto_port_scan_new_devices": false,
+    "authorized_network_consent": false,
+    "authorized_network_consent_timestamp": null
   },
   "logging": {
     "level": "INFO",

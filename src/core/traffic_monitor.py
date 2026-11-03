@@ -7,7 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import psutil
 
@@ -105,15 +105,61 @@ class TrafficMonitor:
         self._window_packets: int = 0
         self._window_ips: set[str] = set()
         self._window_tcp_flags: Dict[str, float] = {}
+        self._live_capture: Any = None
 
         self._init_counters()
         self._seed_initial_history()
+
+    def start_live_pcap(
+        self,
+        interface_name: Optional[str] = None,
+        interface_ip: Optional[str] = None,
+    ) -> bool:
+        """
+        Attempt to start live passive wire capture on the selected network interface using Npcap.
+        If Npcap is unavailable or non-elevated, gracefully returns False and logs honest status.
+        """
+        from src.native.pcap_capture import LivePacketCapture
+
+        if self._live_capture and getattr(self._live_capture, "is_capturing", False):
+            return True
+
+        if not LivePacketCapture.is_pcap_available():
+            return False
+
+        dev_name = LivePacketCapture.find_pcap_device_for_interface(
+            interface_ip=interface_ip,
+            interface_name=interface_name,
+        )
+        if not dev_name:
+            return False
+
+        capture = LivePacketCapture()
+        started = capture.start_capture(
+            device_name=dev_name,
+            packet_callback=self.ingest_raw_packet,
+            promiscuous=False,
+        )
+        if started:
+            self._live_capture = capture
+            return True
+        return False
+
+    def stop_live_pcap(self) -> None:
+        """Stop active live packet capture if running."""
+        if self._live_capture:
+            try:
+                self._live_capture.stop_capture()
+            except Exception:
+                pass
+            self._live_capture = None
 
     def set_demo_mode(self, enabled: bool) -> None:
         """Enable or disable synthetic demo waveform mode and reset baseline samples."""
         self.demo_mode = bool(enabled)
         self._samples.clear()
         self._seed_initial_history()
+
 
     def _init_counters(self) -> None:
         try:
@@ -794,14 +840,20 @@ class TrafficMonitor:
             telemetry_mode = "DEMO_SYNTHETIC"
             telemetry_label = "Demo / Simulated Telemetry Mode (Synthetic Waveform)"
             is_estimated = True
+        elif self._live_capture and getattr(self._live_capture, "is_capturing", False):
+            telemetry_mode = "LIVE_PCAP"
+            active_dev = getattr(self._live_capture, "active_device", "Selected NIC")
+            telemetry_label = f"Live Wire Packet Capture (Npcap active on {active_dev})"
+            is_estimated = False
         elif self._ingested_packets_total > 0 and latest and not latest.is_estimated:
             telemetry_mode = "LIVE_PCAP"
             telemetry_label = "Live Packet Capture (Native C Engine)"
             is_estimated = False
         else:
             telemetry_mode = "ESTIMATED_NIC"
-            telemetry_label = "OS NIC Counters + Estimated Telemetry (Demo/Estimated without Live Pcap)"
+            telemetry_label = "Network Inventory Mode (OS NIC Counters + Estimated Socket Telemetry)"
             is_estimated = True
+
 
         return TelemetrySnapshot(
             total_packets=display_packets,

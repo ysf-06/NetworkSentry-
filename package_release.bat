@@ -47,7 +47,14 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-echo [4/4] Creating Windows Desktop Shortcut (Cyber Guardian - Network Sentry.lnk)...
+echo [4/5] Generating SHA-256 Checksums and Release Archive...
+.\.venv\Scripts\python.exe scripts\package_release.py
+if %ERRORLEVEL% NEQ 0 (
+    echo [Error] Release checksum generation failed.
+    exit /b 1
+)
+
+echo [5/5] Creating Windows Desktop Shortcut (Cyber Guardian - Network Sentry.lnk)...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$desktop = [Environment]::GetFolderPath('Desktop'); " ^
     "$lnkPath = Join-Path $desktop 'Cyber Guardian - Network Sentry.lnk'; " ^

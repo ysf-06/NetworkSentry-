@@ -33,14 +33,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Dependency security vulnerability scan (pip-audit)
+        run: |
+          pip-audit
+
+      - name: Code quality & linting (ruff)
+        run: |
+          ruff check src/ tests/
+
+      - name: Static type checking (mypy)
+        run: |
+          mypy src/ tests/
+
       - name: Build & test Native C Packet Engine (Linux)
         if: runner.os == 'Linux'
         working-directory: src/native
         run: |
           make test
 
-      - name: Run pytest suite (including Linux /proc/net/route & offline route tests)
+      - name: Build Native C Packet Engine (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          gcc -O3 -shared -Wall -Wextra -Werror -o src/native/packet_parser.dll src/native/src/packet_parser.c
+
+      - name: Localhost port scanner verification (self-contained integration test)
+        run: |
+          pytest -v tests/test_localhost_verification.py
+
+      - name: Run full pytest test suite with test coverage
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          pytest -v
+          pytest -v --cov=src --cov-report=term --cov-report=xml
+

@@ -1,5 +1,4 @@
-"""ARP Spoofing, MITM gateway impersonation, and MAC conflict detector."""
-
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 from src.database.db_manager import DatabaseManager
@@ -14,6 +13,7 @@ class ARPSpoofDetector:
     """
     Monitors ARP mappings and live ARP packets for Man-in-the-Middle (MITM)
     ARP cache poisoning, gateway impersonation, and MAC/IP conflicts.
+    Distinguishes true attacks from common DHCP churn, mesh roaming, and router reboots.
     """
 
     def __init__(self, lock_gateway_mac: bool = True) -> None:
@@ -21,6 +21,8 @@ class ARPSpoofDetector:
         self.gateway_ip: Optional[str] = None
         self.locked_gateway_mac: Optional[str] = None
         self._ip_mac_baseline: Dict[str, str] = {}
+        self._ip_mac_first_seen: Dict[str, str] = {}
+        self._ip_mac_last_changed: Dict[str, str] = {}
         self._emitted_alert_keys: Set[str] = set()
 
     def set_gateway(self, gateway_ip: Optional[str], gateway_mac: Optional[str] = None) -> None:
@@ -38,7 +40,48 @@ class ARPSpoofDetector:
         """Clear locked gateway MAC and baseline mappings."""
         self.locked_gateway_mac = None
         self._ip_mac_baseline.clear()
+        self._ip_mac_first_seen.clear()
+        self._ip_mac_last_changed.clear()
         self._emitted_alert_keys.clear()
+
+    def approve_expected_change(
+        self,
+        ip: str,
+        new_mac: str,
+        db: Optional[DatabaseManager] = None,
+        notes: str = "User approved expected network hardware or DHCP change",
+    ) -> bool:
+        """
+        Mark a detected MAC transition for `ip` as an approved, expected network event.
+        Updates locked gateway MAC baseline if applicable, resolves existing alerts,
+        and re-evaluates risk.
+        """
+        norm_mac = OUILookup.normalize_mac(new_mac)
+        clean_ip = ip.strip()
+
+        if self.gateway_ip and clean_ip == self.gateway_ip:
+            self.locked_gateway_mac = norm_mac
+            logger.info("Updated locked default gateway %s to approved MAC %s", clean_ip, norm_mac)
+
+        self._ip_mac_baseline[clean_ip] = norm_mac
+        self._ip_mac_last_changed[clean_ip] = datetime.now().isoformat(timespec="seconds")
+
+        if db is not None:
+            active_alerts = db.get_alerts(unresolved_only=True)
+            for a in active_alerts:
+                if a.ip == clean_ip or a.mac == norm_mac:
+                    if a.id is not None:
+                        db.acknowledge_alert(a.id, notes=notes, mark_resolved=True)
+
+            device = db.get_device_by_mac(norm_mac)
+            if device:
+                device.is_trusted = True
+                db.upsert_device(device)
+                from src.security.risk_engine import RiskEngine
+
+                RiskEngine().evaluate_device(device, db=db)
+
+        return True
 
     def analyze_scan(
         self,
@@ -59,11 +102,14 @@ class ARPSpoofDetector:
 
         alerts: List[SecurityAlertRecord] = []
         mac_to_ips: Dict[str, Set[str]] = {}
+        now = datetime.now().isoformat(timespec="seconds")
 
         for ip_str, mac_set in ip_to_macs.items():
             norm_macs = {OUILookup.normalize_mac(m) for m in mac_set if OUILookup.is_valid_mac(m)}
             if not norm_macs:
                 continue
+
+            self._ip_mac_first_seen.setdefault(ip_str, now)
 
             for m in norm_macs:
                 mac_to_ips.setdefault(m, set()).add(ip_str)
@@ -87,6 +133,9 @@ class ARPSpoofDetector:
                         f"CRITICAL ARP Conflict: IP {ip_str} is claimed by multiple MAC addresses "
                         f"({', '.join(sorted_macs)}). Possible ARP Spoofing / MITM attack!"
                     ),
+                    confidence="HIGH_CONFIDENCE",
+                    first_seen=self._ip_mac_first_seen.get(ip_str, now),
+                    last_changed=now,
                 )
                 self._register_alert(alert, alert_key, alerts, db)
 
@@ -103,6 +152,10 @@ class ARPSpoofDetector:
                         )
                     elif self.lock_gateway_mac and current_gw_mac != self.locked_gateway_mac:
                         alert_key = f"GW_SPOOF:{self.gateway_ip}:{self.locked_gateway_mac}->{current_gw_mac}"
+                        same_vendor = OUILookup.extract_oui(self.locked_gateway_mac) == OUILookup.extract_oui(current_gw_mac)
+                        confidence = "SUSPECTED_DHCP_OR_REBOOT" if same_vendor else "MEDIUM_CONFIDENCE"
+                        vendor_note = " (Same manufacturer OUI: likely router reboot or multi-band Wi-Fi/mesh AP handover)" if same_vendor else ""
+
                         alert = SecurityAlertRecord(
                             alert_type="ARP_SPOOFING",
                             severity="CRITICAL",
@@ -110,8 +163,11 @@ class ARPSpoofDetector:
                             ip=self.gateway_ip,
                             description=(
                                 f"CRITICAL MITM Alert: Default Gateway ({self.gateway_ip}) MAC changed "
-                                f"from locked {self.locked_gateway_mac} to {current_gw_mac}!"
+                                f"from locked {self.locked_gateway_mac} to {current_gw_mac}!{vendor_note}"
                             ),
+                            confidence=confidence,
+                            first_seen=self._ip_mac_first_seen.get(ip_str, now),
+                            last_changed=now,
                         )
                         self._register_alert(alert, alert_key, alerts, db)
 
@@ -121,17 +177,26 @@ class ARPSpoofDetector:
                 prev_mac = self._ip_mac_baseline.get(ip_str)
                 if prev_mac and prev_mac != single_mac and ip_str != self.gateway_ip:
                     alert_key = f"MAC_FLIP:{ip_str}:{prev_mac}->{single_mac}"
+                    is_rand = OUILookup.is_locally_administered(single_mac)
+                    same_oui = OUILookup.extract_oui(prev_mac) == OUILookup.extract_oui(single_mac)
+                    confidence = "SUSPECTED_DHCP_OR_REBOOT" if (is_rand or same_oui) else "MEDIUM_CONFIDENCE"
+                    hint = " (Likely DHCP lease expiration, device reboot, or private Wi-Fi MAC rotation)" if (is_rand or same_oui) else ""
+
                     alert = SecurityAlertRecord(
                         alert_type="MAC_FLAPPING",
                         severity="WARNING",
                         mac=single_mac,
                         ip=ip_str,
                         description=(
-                            f"Host IP {ip_str} switched MAC address from {prev_mac} to {single_mac}."
+                            f"Host IP {ip_str} switched MAC address from {prev_mac} to {single_mac}.{hint}"
                         ),
+                        confidence=confidence,
+                        first_seen=self._ip_mac_first_seen.get(ip_str, now),
+                        last_changed=now,
                     )
                     self._register_alert(alert, alert_key, alerts, db)
                 self._ip_mac_baseline[ip_str] = single_mac
+                self._ip_mac_last_changed[ip_str] = now
 
         # Check 3: Single MAC claiming multiple IPs (especially if it matches Gateway MAC!)
         for mac_addr, claimed_ips in mac_to_ips.items():
@@ -155,10 +220,15 @@ class ARPSpoofDetector:
                             f"CRITICAL ARP Poisoning: MAC {mac_addr} is responding for both "
                             f"Default Gateway and host(s): {', '.join(sorted_ips)}!"
                         ),
+                        confidence="HIGH_CONFIDENCE",
+                        first_seen=self._ip_mac_first_seen.get(target_ip, now),
+                        last_changed=now,
                     )
                     self._register_alert(alert, alert_key, alerts, db)
                 else:
                     alert_key = f"MULTI_IP:{mac_addr}:{','.join(sorted_ips)}"
+                    is_rand = OUILookup.is_locally_administered(mac_addr)
+                    confidence = "SUSPECTED_DHCP_OR_REBOOT" if is_rand else "MEDIUM_CONFIDENCE"
                     alert = SecurityAlertRecord(
                         alert_type="MAC_FLAPPING",
                         severity="WARNING",
@@ -168,10 +238,14 @@ class ARPSpoofDetector:
                             f"Single MAC {mac_addr} is associated with multiple IPs simultaneously: "
                             f"{', '.join(sorted_ips)}."
                         ),
+                        confidence=confidence,
+                        first_seen=self._ip_mac_first_seen.get(target_ip, now),
+                        last_changed=now,
                     )
                     self._register_alert(alert, alert_key, alerts, db)
 
         return alerts
+
 
     def inspect_arp_packet(
         self,
@@ -198,6 +272,7 @@ class ARPSpoofDetector:
             bool(norm_eth_src) and OUILookup.is_valid_mac(norm_eth_src) and norm_eth_src != norm_src_mac
         )
 
+        now = datetime.now().isoformat(timespec="seconds")
         # 0. Ethernet frame source MAC != ARP Sender Hardware Address (L2/L3 header forgery)
         if has_header_mismatch:
             culprit_mac = norm_eth_src if OUILookup.is_valid_mac(norm_eth_src) else norm_src_mac
@@ -210,6 +285,9 @@ class ARPSpoofDetector:
                     f"Live Packet Alert: Ethernet/ARP MAC Mismatch! Frame sent by physical MAC "
                     f"{culprit_mac} but forged ARP Sender MAC {norm_src_mac} for IP {src_ip}."
                 ),
+                confidence="HIGH_CONFIDENCE",
+                first_seen=self._ip_mac_first_seen.get(src_ip, now),
+                last_changed=now,
             )
             if db is not None:
                 alert.id = db.record_alert(alert)
@@ -220,6 +298,8 @@ class ARPSpoofDetector:
             if self.locked_gateway_mac is None or not self.lock_gateway_mac:
                 self.locked_gateway_mac = norm_src_mac
             elif norm_src_mac != self.locked_gateway_mac:
+                same_vendor = OUILookup.extract_oui(self.locked_gateway_mac) == OUILookup.extract_oui(norm_src_mac)
+                conf = "SUSPECTED_DHCP_OR_REBOOT" if same_vendor else "HIGH_CONFIDENCE"
                 alert = SecurityAlertRecord(
                     alert_type="ARP_SPOOFING",
                     severity="CRITICAL",
@@ -230,6 +310,9 @@ class ARPSpoofDetector:
                         f"{'Reply' if opcode == 2 else 'Request'} claiming Gateway IP {src_ip} "
                         f"(Expected {self.locked_gateway_mac}, gratuitous={is_gratuitous})."
                     ),
+                    confidence=conf,
+                    first_seen=self._ip_mac_first_seen.get(src_ip, now),
+                    last_changed=now,
                 )
                 if db is not None:
                     alert.id = db.record_alert(alert)
@@ -238,6 +321,8 @@ class ARPSpoofDetector:
         # 2. Gratuitous ARP Reply changing an existing baseline IP->MAC mapping
         prev_mac = self._ip_mac_baseline.get(src_ip)
         if prev_mac and prev_mac != norm_src_mac and (opcode == 2 or is_gratuitous):
+            same_vendor = OUILookup.extract_oui(prev_mac) == OUILookup.extract_oui(norm_src_mac)
+            conf = "SUSPECTED_DHCP_OR_REBOOT" if same_vendor else ("HIGH_CONFIDENCE" if is_gratuitous else "MEDIUM_CONFIDENCE")
             alert = SecurityAlertRecord(
                 alert_type="ARP_SPOOFING",
                 severity="CRITICAL" if is_gratuitous else "WARNING",
@@ -247,10 +332,14 @@ class ARPSpoofDetector:
                     f"Suspicious ARP {'Gratuitous ' if is_gratuitous else ''}Packet: "
                     f"IP {src_ip} claimed by {norm_src_mac} (previously {prev_mac})."
                 ),
+                confidence=conf,
+                first_seen=self._ip_mac_first_seen.get(src_ip, now),
+                last_changed=now,
             )
             if db is not None:
                 alert.id = db.record_alert(alert)
             return alert
+
 
         self._ip_mac_baseline[src_ip] = norm_src_mac
         return None

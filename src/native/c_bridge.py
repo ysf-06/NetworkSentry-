@@ -247,9 +247,16 @@ class NativePacketEngine:
         return "NetworkSentry-PythonFallback/1.0.0"
 
     def is_pcap_available(self) -> bool:
-        """Return True if Npcap / libpcap is installed on the host."""
+        """Return True if Npcap / libpcap is accessible for wire capture."""
+        from src.native.pcap_capture import LivePacketCapture
+
+        if LivePacketCapture.is_pcap_available():
+            return True
         if self._lib is not None:
-            return bool(self._lib.is_pcap_available() == 1)
+            try:
+                return bool(self._lib.is_pcap_available() == 1)
+            except Exception:
+                pass
         return False
 
     @staticmethod

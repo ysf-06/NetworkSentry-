@@ -226,6 +226,7 @@ def test_port_scanner_logs_errno_on_closed_port_and_oserror(caplog, monkeypatch)
     """Verify that PortScanner logs exact errno/winerror details to debug log when connect_ex or OSError occurs."""
     import errno
     import logging
+
     from src.security import port_scanner as ps_mod
 
     # Production logger must have DEBUG effective level so RotatingFileHandler receives DEBUG records
@@ -287,4 +288,47 @@ def test_port_scanner_logs_errno_on_closed_port_and_oserror(caplog, monkeypatch)
     assert res3 is None
     expected_timeout_code = getattr(errno, "WSAETIMEDOUT", errno.ETIMEDOUT)
     assert any(f"errno={expected_timeout_code}" in rec.message for rec in caplog.records)
+
+
+def test_arp_confidence_and_approve_expected_change(tmp_path: Path) -> None:
+    """Verify confidence classification and approval of expected hardware/DHCP changes."""
+    db = DatabaseManager(db_path=tmp_path / "test_confidence.db")
+    detector = ARPSpoofDetector(lock_gateway_mac=True)
+    gw_ip = "192.168.1.1"
+    gw_mac_a = "50:C7:BF:11:22:33"
+    gw_mac_b = "50:C7:BF:99:88:77"  # Same TP-Link OUI (e.g. 5GHz radio vs 2.4GHz radio or mesh node)
+
+    detector.set_gateway(gw_ip, gw_mac_a)
+
+    # 1. Same-vendor MAC transition triggers SUSPECTED_DHCP_OR_REBOOT confidence
+    alerts = detector.analyze_scan(
+        ip_to_macs={gw_ip: {gw_mac_b}},
+        devices=[],
+        gateway_ip=gw_ip,
+        db=db,
+    )
+    assert len(alerts) == 1
+    assert alerts[0].confidence == "SUSPECTED_DHCP_OR_REBOOT"
+    assert alerts[0].first_seen is not None
+    assert alerts[0].last_changed is not None
+
+    # 2. Approve expected change
+    approved = detector.approve_expected_change(
+        ip=gw_ip,
+        new_mac=gw_mac_b,
+        db=db,
+        notes="Mesh Wi-Fi roaming handover approved by admin",
+    )
+    assert approved is True
+    assert detector.locked_gateway_mac == gw_mac_b
+
+    # Verify existing alerts for this IP in DB are resolved and acknowledged
+    db_alerts = db.get_alerts(unresolved_only=True)
+    assert len(db_alerts) == 0
+
+    all_alerts = db.get_alerts(unresolved_only=False)
+    assert len(all_alerts) == 1
+    assert all_alerts[0].is_acknowledged is True
+    assert "Mesh Wi-Fi" in all_alerts[0].acknowledgement_notes
+
 

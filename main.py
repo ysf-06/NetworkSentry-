@@ -40,6 +40,7 @@ def _prepare_working_directory(config_path: str = "config.json") -> None:
 
 _prepare_working_directory()
 
+from src._version import __version__
 from src.core.arp_scanner import ARPScanner
 from src.core.interface_detector import InterfaceDetector
 from src.database.db_manager import DatabaseManager
@@ -64,8 +65,9 @@ def run_diagnostics(config_path: str = "config.json") -> int:
     )
 
     print("=" * 74)
-    print("  NETWORK SENTRY v1.1.0 — System & Security Engine Diagnostics")
+    print(f"  NETWORK SENTRY v{__version__} — System & Security Engine Diagnostics")
     print("=" * 74)
+
     print(f"  App Data Dir : {get_app_data_dir()}")
 
     # 1. Detect Network Interfaces
@@ -158,10 +160,19 @@ def run_cli_scan(
         print("[Error] No active IPv4 network interface detected.")
         return 1
 
+    if not bool(cfg.get("security", "authorized_network_consent", False)):
+        print("\n[!] NOTICE: Authorized Networks Only")
+        print("    You must only scan networks and devices you own or have explicit authorization to assess.")
+        print("    Set 'authorized_network_consent': true in config.json to confirm authorization.\n")
+
     print(f"[*] Scanning subnet {active.cidr} on interface '{active.name}' (GW: {active.gateway_ip})...")
-    scanner = ARPScanner()
+    max_workers = int(cfg.get("network", "max_workers", 24))
+    rate_limit_pps = int(cfg.get("network", "rate_limit_pps", 100))
+    delay_ms = 1000.0 / float(rate_limit_pps) if rate_limit_pps > 0 else 0.0
+
+    scanner = ARPScanner(max_workers=max_workers, rate_limit_delay_ms=delay_ms)
     spoof_detector = ARPSpoofDetector(lock_gateway_mac=bool(cfg.get("security", "lock_gateway_mac", True)))
-    port_scanner = PortScanner(timeout=0.35, max_workers=24)
+    port_scanner = PortScanner(timeout=0.35, max_workers=max_workers, rate_limit_delay_ms=delay_ms)
     risk_engine = RiskEngine()
 
     result = scanner.scan_and_sync(
@@ -205,7 +216,9 @@ def run_cli_scan(
 def run_gui(config_path: str = "config.json") -> int:
     """Launch the PySide6 Desktop Application."""
     import ctypes
+
     from PySide6.QtWidgets import QApplication
+
     from src.gui.main_window import MainWindow
     from src.gui.widgets.cyber_charts import create_cyber_guardian_icon
 
@@ -265,6 +278,16 @@ def main() -> None:
         help="Run a single CLI network discovery and security scan and exit",
     )
     parser.add_argument(
+        "--test-localhost",
+        action="store_true",
+        help="Run ephemeral localhost port scanner verification test and exit",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
         "--export-csv",
         default=None,
         help="Export device list to CSV path (used with --scan)",
@@ -276,9 +299,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.test_localhost:
+        _ensure_cli_console()
+        print("=" * 74)
+        print(f"  NETWORK SENTRY v{__version__} — Localhost Port Verification Test")
+        print("=" * 74)
+        res = PortScanner.run_localhost_verification()
+        print("  Target IP              : 127.0.0.1")
+        print(f"  Ephemeral Open Port    : {res['open_port']} (Detected: {res['detected']}, Elapsed: {res.get('elapsed_ms', 0)} ms)")
+        print(f"  Ephemeral Closed Port  : {res['closed_port']} (Negative Check: {res['negative_check_passed']})")
+        if res.get("record"):
+            print(f"  Banner Grabbed         : '{res['record'].banner}'")
+        print(f"  Verification Result    : {'PASSED' if res['success'] else 'FAILED'}")
+        print("=" * 74)
+        sys.exit(0 if res["success"] else 1)
+
     if args.diagnostics:
         _ensure_cli_console()
         sys.exit(run_diagnostics(config_path=args.config))
+
     if args.scan:
         _ensure_cli_console()
         sys.exit(

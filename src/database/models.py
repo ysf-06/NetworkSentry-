@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 
 @dataclass
@@ -49,7 +49,13 @@ class SecurityAlertRecord:
     description: str
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     is_resolved: bool = False
+    confidence: str = "HIGH_CONFIDENCE"  # HIGH_CONFIDENCE, MEDIUM_CONFIDENCE, SUSPECTED_DHCP_OR_REBOOT
+    first_seen: Optional[str] = None
+    last_changed: Optional[str] = None
+    is_acknowledged: bool = False
+    acknowledgement_notes: str = ""
     id: Optional[int] = None
+
 
 
 @dataclass

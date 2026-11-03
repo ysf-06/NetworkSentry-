@@ -229,8 +229,8 @@ def test_cyber_guardian_dashboard_and_traffic_overview_widgets(tmp_path: Path) -
     # Verify Photo 1 Dashboard widgets reflect database state
     win.switch_page(0)
     assert win.port_gauge.open_ports == 2
-    assert win.recent_scan_table.rowCount() >= 1
-    assert "SSH" in win.recent_scan_table.item(0, 1).text()
+    table_item = win.recent_scan_table.item(0, 1)
+    assert table_item is not None and "SSH" in table_item.text()
 
     # Test timeline slider scrubbing & timeline window dropdown modes
     win.timeline_slider.setValue(50)
@@ -304,6 +304,7 @@ def test_cyber_guardian_dashboard_and_traffic_overview_widgets(tmp_path: Path) -
 def test_traffic_monitor_no_fabricated_startup_waves_and_honest_labeling(tmp_path: Path) -> None:
     """Verify P1 #1 fix: TrafficMonitor does not fabricate startup sine waves or inflate counters by default."""
     import struct
+
     from src.core.traffic_monitor import TrafficMonitor
     from src.native.c_bridge import NativePacketEngine
 

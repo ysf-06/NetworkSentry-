@@ -1,7 +1,33 @@
-# Network Sentry (v1.0.0)
+# Cyber Guardian / Network Sentry (v1.3.0)
 
-**Local Network Device Discovery, Native C Packet Engine & Real-Time Threat Detection System**  
-*(Yerel Ağ Cihaz Keşif, Native C Paket Motoru ve Gerçek Zamanlı Güvenlik Tehdit Algılama Sistemi)*
+**Local Network Device Discovery, Native C Packet Engine, Npcap Live Wire Capture & Real-Time Threat Detection System**  
+*(Yerel Ağ Cihaz Keşif, Native C Paket Motoru, Npcap Canlı Paket Yakalama ve Gerçek Zamanlı Güvenlik Tehdit Algılama Sistemi)*
+
+---
+
+## Important Notice & Limitations (Sınırlamalar ve Çalışma Modları)
+
+1. **Active Wire Packet Capture Requires Npcap**:
+   - Real-time wire frame acquisition requires **[Npcap](https://npcap.com/)** (Windows) or **libpcap** (Linux).
+   - On Windows, Npcap by default enforces `AdminOnly = 0x1`. In standard (non-elevated) sessions or when Npcap is not installed, the application automatically, safely, and honestly operates in **Network Inventory Mode (`ESTIMATED_NIC`)**. In this mode, telemetry is computed directly from OS socket tables (`psutil.net_connections`) and interface I/O counters without deadlocking.
+   - To activate raw wire capture, install Npcap with *"WinPcap API-compatible Mode"* enabled and run Cyber Guardian as Administrator.
+
+2. **Authorized Networks Only (Yalnızca Yetkili Ağlar)**:
+   - Network scanning and port inspection must **only** be conducted on local networks and devices that you own or have explicit authorization to assess.
+   - Cyber Guardian includes an explicit authorization consent gate before any ARP sweep or port probe begins.
+   - Automated port scanning of newly discovered devices is disabled by default (`auto_port_scan_new_devices: false`).
+
+3. **Safe Localhost Verification Mode**:
+   - To verify that the socket scanning subsystem is functioning properly without emitting a single packet onto the external network, use the self-contained localhost test mode:
+     ```powershell
+     python main.py --test-localhost
+     ```
+   - This spins up an ephemeral local loopback TCP listener, probes it, validates detection and banner extraction, and shuts down cleanly.
+
+4. **Alert Confidence & False Positive Reduction**:
+   - MAC address changes are not always malicious ARP spoofing attacks. Router reboots, dual-band (2.4/5 GHz) Wi-Fi handoffs, mesh Wi-Fi AP roaming, and DHCP lease expirations are common in residential and corporate networks.
+   - Alerts are tagged with confidence levels (`HIGH_CONFIDENCE`, `MEDIUM_CONFIDENCE`, `SUSPECTED_DHCP_OR_REBOOT`) and include `first_seen` / `last_changed` timestamps.
+   - Operators can click **"Approve Expected Change"** in the GUI or call `approve_expected_change()` to update the locked gateway baseline and resolve alerts.
 
 ---
 

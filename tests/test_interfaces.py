@@ -86,9 +86,7 @@ def test_primary_outbound_ip_uses_routing_table_without_external_ips(monkeypatch
     import socket
     from types import SimpleNamespace
 
-    real_socket = socket.socket
-
-    class GuardedSocket(real_socket):
+    class GuardedSocket(socket.socket):
         def connect(self, address):
             host = address[0] if isinstance(address, tuple) else str(address)
             assert host not in ("8.8.8.8", "1.1.1.1"), f"Unexpected external probe to {host}"

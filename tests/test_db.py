@@ -134,3 +134,70 @@ def test_alerts_and_port_scans_and_sessions(tmp_path: Path) -> None:
     )
     db.finish_scan_session(session_id, devices_found=5, new_devices=2, alerts_triggered=1)
 
+
+def test_db_schema_migrations_and_maintenance(tmp_path: Path) -> None:
+    """Verify persistent data management: migrations, backups, retention pruning, and purging."""
+    import json
+    import sqlite3
+
+    db_file = tmp_path / "test_lifecycle.db"
+    db = DatabaseManager(db_path=db_file)
+
+    # 1. Verify schema migrations table was initialized with version 2
+    with sqlite3.connect(db_file) as conn:
+        mig_row = conn.execute("SELECT version, description FROM schema_migrations WHERE version = 2").fetchone()
+        assert mig_row is not None
+        assert "confidence" in mig_row[1]
+
+    # 2. Add device, alert, and history
+    db.upsert_device(
+        DeviceRecord(
+            mac="AA:11:22:33:44:55",
+            ip="192.168.1.100",
+            hostname="host-test",
+            vendor="TestVendor",
+            is_online=True,
+            is_trusted=False,
+        )
+    )
+    aid = db.record_alert(
+        SecurityAlertRecord(
+            alert_type="NEW_DEVICE",
+            severity="WARNING",
+            mac="AA:11:22:33:44:55",
+            ip="192.168.1.100",
+            description="Untrusted device connected",
+            confidence="HIGH_CONFIDENCE",
+        )
+    )
+    assert aid > 0
+
+    # Test acknowledge alert
+    ack_res = db.acknowledge_alert(aid, notes="Known test host", mark_resolved=True)
+    assert ack_res is True
+    recs = db.get_alerts(unresolved_only=False)
+    assert recs[0].is_acknowledged is True
+    assert recs[0].acknowledgement_notes == "Known test host"
+    assert recs[0].is_resolved is True
+
+    # 3. Export JSON backup
+    backup_file = tmp_path / "backup.json"
+    exported_path = db.export_data_backup(backup_file)
+    assert Path(exported_path).exists()
+    backup_data = json.loads(Path(exported_path).read_text(encoding="utf-8"))
+    assert backup_data["schema_version"] == 2
+    assert len(backup_data["devices"]) >= 1
+    assert len(backup_data["security_alerts"]) >= 1
+
+    # 4. Prune records
+    pruned = db.prune_old_records(retention_days=0)
+    assert isinstance(pruned, dict)
+    assert "device_history" in pruned
+    assert "security_alerts" in pruned
+
+    # 5. Clear all data
+    purged = db.clear_all_data(keep_trusted_devices=False)
+    assert purged["devices_deleted"] >= 1
+    assert db.get_dashboard_stats()["total_devices"] == 0
+
+

@@ -13,7 +13,11 @@ from src.database.models import (
     ScanSessionRecord,
     SecurityAlertRecord,
 )
-from src.utils.logger import resolve_data_path
+from src.utils.logger import resolve_data_path, setup_logger
+
+logger = setup_logger("DatabaseManager")
+
+SCHEMA_VERSION = 2
 
 
 class DatabaseManager:
@@ -38,10 +42,16 @@ class DatabaseManager:
         return conn
 
     def initialize_schema(self) -> None:
-        """Create all required tables and indexes if they do not exist."""
+        """Create all required tables, indexes, and apply versioned migrations."""
         with self._lock, self._get_connection() as conn:
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS devices (
                     mac TEXT PRIMARY KEY,
                     ip TEXT NOT NULL,
@@ -74,7 +84,12 @@ class DatabaseManager:
                     ip TEXT NOT NULL,
                     description TEXT NOT NULL,
                     is_resolved INTEGER DEFAULT 0,
-                    timestamp TEXT NOT NULL
+                    timestamp TEXT NOT NULL,
+                    confidence TEXT DEFAULT 'HIGH_CONFIDENCE',
+                    first_seen TEXT,
+                    last_changed TEXT,
+                    is_acknowledged INTEGER DEFAULT 0,
+                    acknowledgement_notes TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS port_scans (
@@ -109,6 +124,30 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_history_mac ON device_history(mac);
                 """
             )
+
+            # Apply incremental schema column migrations for pre-existing databases
+            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(security_alerts);").fetchall()}
+            if "confidence" not in existing_cols:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN confidence TEXT DEFAULT 'HIGH_CONFIDENCE';")
+            if "first_seen" not in existing_cols:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN first_seen TEXT;")
+            if "last_changed" not in existing_cols:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN last_changed TEXT;")
+            if "is_acknowledged" not in existing_cols:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN is_acknowledged INTEGER DEFAULT 0;")
+            if "acknowledgement_notes" not in existing_cols:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN acknowledgement_notes TEXT DEFAULT '';")
+
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) VALUES (1, ?, 'Initial baseline tables')",
+                (now_iso,),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) VALUES (2, ?, 'Add confidence and acknowledgement fields to security_alerts')",
+                (now_iso,),
+            )
+
 
     def check_health(self) -> Dict[str, Any]:
         """Verify database connection, WAL mode status, and table counts."""
@@ -323,8 +362,9 @@ class DatabaseManager:
             cursor = conn.execute(
                 """
                 INSERT INTO security_alerts (
-                    alert_type, severity, mac, ip, description, is_resolved, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    alert_type, severity, mac, ip, description, is_resolved, timestamp,
+                    confidence, first_seen, last_changed, is_acknowledged, acknowledgement_notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alert.alert_type,
@@ -334,14 +374,39 @@ class DatabaseManager:
                     alert.description,
                     1 if alert.is_resolved else 0,
                     alert.timestamp,
+                    alert.confidence or "HIGH_CONFIDENCE",
+                    alert.first_seen,
+                    alert.last_changed,
+                    1 if alert.is_acknowledged else 0,
+                    alert.acknowledgement_notes or "",
                 ),
             )
-            return int(cursor.lastrowid)
+            return int(cursor.lastrowid or 0)
 
     def resolve_alert(self, alert_id: int) -> None:
         """Mark a specific security alert as resolved."""
         with self._lock, self._get_connection() as conn:
             conn.execute("UPDATE security_alerts SET is_resolved = 1 WHERE id = ?", (alert_id,))
+
+    def acknowledge_alert(
+        self,
+        alert_id: int,
+        notes: str = "",
+        mark_resolved: bool = True,
+    ) -> bool:
+        """Mark an alert as acknowledged by the user as an expected change and optionally resolve it."""
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE security_alerts
+                SET is_acknowledged = 1,
+                    acknowledgement_notes = ?,
+                    is_resolved = ?
+                WHERE id = ?
+                """,
+                (notes, 1 if mark_resolved else 0, alert_id),
+            )
+            return cursor.rowcount > 0
 
     def resolve_all_alerts(self) -> int:
         """Mark all unresolved security alerts as resolved."""
@@ -367,9 +432,15 @@ class DatabaseManager:
                     description=r["description"],
                     is_resolved=bool(r["is_resolved"]),
                     timestamp=r["timestamp"],
+                    confidence=r["confidence"] if "confidence" in r.keys() and r["confidence"] else "HIGH_CONFIDENCE",
+                    first_seen=r["first_seen"] if "first_seen" in r.keys() else None,
+                    last_changed=r["last_changed"] if "last_changed" in r.keys() else None,
+                    is_acknowledged=bool(r["is_acknowledged"]) if "is_acknowledged" in r.keys() else False,
+                    acknowledgement_notes=r["acknowledgement_notes"] if "acknowledgement_notes" in r.keys() and r["acknowledgement_notes"] else "",
                 )
                 for r in rows
             ]
+
 
     def save_port_scan(self, record: PortScanRecord) -> None:
         """Insert or update an open port entry for a device."""
@@ -507,7 +578,7 @@ class DatabaseManager:
                     session.finished_at,
                 ),
             )
-            return int(cursor.lastrowid)
+            return int(cursor.lastrowid or 0)
 
     def finish_scan_session(
         self, session_id: int, devices_found: int, new_devices: int, alerts_triggered: int
@@ -523,6 +594,28 @@ class DatabaseManager:
                 """,
                 (devices_found, new_devices, alerts_triggered, now, session_id),
             )
+
+    def get_recent_sessions(self, limit: int = 50) -> List[ScanSessionRecord]:
+        """Retrieve recent scan sessions ordered by started_at DESC."""
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scan_sessions ORDER BY started_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [
+                ScanSessionRecord(
+                    id=r["id"],
+                    interface_name=r["interface_name"],
+                    subnet_cidr=r["subnet_cidr"],
+                    gateway_ip=r["gateway_ip"],
+                    devices_found=r["devices_found"],
+                    new_devices=r["new_devices"],
+                    alerts_triggered=r["alerts_triggered"],
+                    started_at=r["started_at"],
+                    finished_at=r["finished_at"],
+                )
+                for r in rows
+            ]
 
     def get_dashboard_stats(self) -> Dict[str, int]:
         """Compute summary statistics for the UI dashboard."""
@@ -560,4 +653,154 @@ class DatabaseManager:
             risk_score=int(row["risk_score"]),
             notes=row["notes"] or "",
         )
+
+    def export_data_backup(self, target_path: str | Path) -> str:
+        """
+        Export complete database snapshot (all tables) into a structured JSON backup.
+        Returns the absolute string path of the generated export.
+        """
+        import json
+
+        out_path = Path(target_path).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data: Dict[str, Any] = {
+            "version": SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "devices": [
+                {
+                    "mac": d.mac,
+                    "ip": d.ip,
+                    "hostname": d.hostname,
+                    "vendor": d.vendor,
+                    "first_seen": d.first_seen,
+                    "last_seen": d.last_seen,
+                    "is_online": d.is_online,
+                    "is_trusted": d.is_trusted,
+                    "risk_level": d.risk_level,
+                    "risk_score": d.risk_score,
+                    "notes": d.notes,
+                }
+                for d in self.get_all_devices(online_only=False)
+            ],
+            "security_alerts": [
+                {
+                    "id": a.id,
+                    "alert_type": a.alert_type,
+                    "severity": a.severity,
+                    "mac": a.mac,
+                    "ip": a.ip,
+                    "description": a.description,
+                    "timestamp": a.timestamp,
+                    "is_resolved": a.is_resolved,
+                    "confidence": a.confidence,
+                    "first_seen": a.first_seen,
+                    "last_changed": a.last_changed,
+                    "is_acknowledged": a.is_acknowledged,
+                    "acknowledgement_notes": a.acknowledgement_notes,
+                }
+                for a in self.get_alerts(limit=10000, unresolved_only=False)
+            ],
+            "port_scans": [
+                {
+                    "mac": p.mac,
+                    "ip": p.ip,
+                    "port": p.port,
+                    "protocol": p.protocol,
+                    "service": p.service,
+                    "banner": p.banner,
+                    "state": p.state,
+                    "scanned_at": p.scanned_at,
+                }
+                for p in self.get_all_port_scans()
+            ],
+            "device_history": [
+                {
+                    "mac": h.mac,
+                    "ip": h.ip,
+                    "event_type": h.event_type,
+                    "timestamp": h.timestamp,
+                    "details": h.details,
+                }
+                for h in self.get_device_history(limit=5000)
+            ],
+            "scan_sessions": [
+                {
+                    "interface_name": s.interface_name,
+                    "subnet_cidr": s.subnet_cidr,
+                    "gateway_ip": s.gateway_ip,
+                    "devices_found": s.devices_found,
+                    "new_devices": s.new_devices,
+                    "alerts_triggered": s.alerts_triggered,
+                    "started_at": s.started_at,
+                    "finished_at": s.finished_at,
+                }
+                for s in self.get_recent_sessions(limit=500)
+            ],
+        }
+        out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(out_path)
+
+    def clear_all_data(self, keep_trusted_devices: bool = False) -> Dict[str, int]:
+        """
+        Purge stored network telemetry, alerts, and history.
+        Optionally retains devices flagged as is_trusted=True.
+        Runs VACUUM to reclaim SQLite page space.
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                p_cnt = conn.execute("DELETE FROM port_scans;").rowcount
+                a_cnt = conn.execute("DELETE FROM security_alerts;").rowcount
+                h_cnt = conn.execute("DELETE FROM device_history;").rowcount
+                s_cnt = conn.execute("DELETE FROM scan_sessions;").rowcount
+
+                if keep_trusted_devices:
+                    d_cnt = conn.execute("DELETE FROM devices WHERE is_trusted = 0;").rowcount
+                else:
+                    d_cnt = conn.execute("DELETE FROM devices;").rowcount
+
+            try:
+                vac_conn = self._get_connection()
+                try:
+                    old_iso = vac_conn.isolation_level
+                    vac_conn.isolation_level = None
+                    vac_conn.execute("VACUUM;")
+                    vac_conn.isolation_level = old_iso
+                finally:
+                    vac_conn.close()
+            except Exception as exc:
+                logger.debug("VACUUM after purge skipped: %s", exc)
+
+            return {
+                "devices": d_cnt,
+                "devices_deleted": d_cnt,
+                "port_scans": p_cnt,
+                "security_alerts": a_cnt,
+                "device_history": h_cnt,
+                "scan_sessions": s_cnt,
+            }
+
+    def prune_old_records(self, retention_days: int = 30) -> Dict[str, int]:
+        """
+        Prune device history, scan sessions, and resolved security alerts older than `retention_days`.
+        """
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now() - timedelta(days=max(1, retention_days))).isoformat(timespec="seconds")
+
+        with self._lock, self._get_connection() as conn:
+            h_cnt = conn.execute("DELETE FROM device_history WHERE timestamp < ?;", (cutoff,)).rowcount
+            s_cnt = conn.execute("DELETE FROM scan_sessions WHERE started_at < ?;", (cutoff,)).rowcount
+            a_cnt = conn.execute(
+                "DELETE FROM security_alerts WHERE is_resolved = 1 AND timestamp < ?;",
+                (cutoff,),
+            ).rowcount
+
+            return {
+                "device_history": h_cnt,
+                "scan_sessions": s_cnt,
+                "security_alerts": a_cnt,
+            }
+
 
