@@ -363,8 +363,9 @@ def test_appdata_writable_paths_when_cwd_unwritable(tmp_path: Path, monkeypatch)
     """Verify P1 #2 fix: relative log/DB/config paths resolve to writable AppData and never crash."""
     from src.utils.logger import get_app_data_dir, resolve_data_path, setup_logger
 
-    custom_appdata = tmp_path / "LocalAppData"
+    custom_appdata = tmp_path / "AppDataTest"
     monkeypatch.setenv("LOCALAPPDATA", str(custom_appdata))
+    monkeypatch.setenv("XDG_DATA_HOME", str(custom_appdata))
 
     app_dir = get_app_data_dir()
     assert app_dir == (custom_appdata / "NetworkSentry").resolve()
