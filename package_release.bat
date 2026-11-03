@@ -23,7 +23,9 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-echo [3/4] Packaging Standalone Windows Desktop App with PyInstaller...
+echo [3/5] Packaging Standalone Windows Desktop App with PyInstaller...
+if exist "dist\NetworkSentry\networksentry.db*" del /f /q "dist\NetworkSentry\networksentry.db*" 2>nul
+if exist "networksentry.db*" del /f /q "networksentry.db*" 2>nul
 .\.venv\Scripts\pyinstaller.exe ^
     --noconfirm ^
     --clean ^

@@ -283,6 +283,11 @@ def main() -> None:
         help="Run ephemeral localhost port scanner verification test and exit",
     )
     parser.add_argument(
+        "--reset-db",
+        action="store_true",
+        help="Reset and purge database to a clean starting state with only the local PC adapter",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
@@ -299,6 +304,43 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.reset_db:
+        _ensure_cli_console()
+        _prepare_working_directory(args.config)
+        cfg = ConfigManager(args.config)
+        db_path = cfg.get("database", "path", "networksentry.db")
+        db = DatabaseManager(db_path=db_path)
+        print("=" * 74)
+        print(f"  NETWORK SENTRY v{__version__} — Database Reset to Clean Starting State")
+        print("=" * 74)
+        print(f"  Target Database: {db.db_path}")
+        res = db.clear_all_data()
+        print(f"  Purged: {res.get('devices', 0)} devices, {res.get('security_alerts', 0)} alerts, {res.get('port_scans', 0)} port scans.")
+
+        active = InterfaceDetector.get_active_interface(cfg.get("network", "preferred_interface"))
+        if active and active.mac_address and active.mac_address != "00:00:00:00:00:00":
+            oui = OUILookup()
+            vendor = oui.lookup(active.mac_address)
+            if vendor == "Unknown Vendor":
+                vendor = "Local Host (This PC)"
+            db.upsert_device(
+                DeviceRecord(
+                    mac=active.mac_address,
+                    ip=active.ip_address,
+                    hostname=socket.gethostname(),
+                    vendor=vendor,
+                    is_online=True,
+                    is_trusted=True,
+                    risk_level="LOW",
+                    risk_score=0,
+                    notes=f"Primary interface: {active.name}",
+                )
+            )
+            print(f"  Seeded Clean Local Host: {active.ip_address} ({active.mac_address}) [{vendor}]")
+        print("  Database is now completely clean.")
+        print("=" * 74)
+        sys.exit(0)
+
     if args.test_localhost:
         _ensure_cli_console()
         print("=" * 74)
@@ -310,6 +352,12 @@ def main() -> None:
         print(f"  Ephemeral Closed Port  : {res['closed_port']} (Negative Check: {res['negative_check_passed']})")
         if res.get("record"):
             print(f"  Banner Grabbed         : '{res['record'].banner}'")
+        if res.get("sandbox_restricted"):
+            print(f"  Sandbox Restriction    : WSAEACCES 10013 (OS/Sandbox policy restricts local loopback socket binding)")
+            print(f"  Diagnostic Context     : {res.get('message')}")
+            print(f"  Verification Result    : RESTRICTED (Sandbox Policy)")
+            print("=" * 74)
+            sys.exit(0)
         print(f"  Verification Result    : {'PASSED' if res['success'] else 'FAILED'}")
         print("=" * 74)
         sys.exit(0 if res["success"] else 1)

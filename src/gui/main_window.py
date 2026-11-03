@@ -1379,6 +1379,10 @@ class MainWindow(QMainWindow):
         self.btn_export_db_backup.clicked.connect(self.export_full_db_backup)
         db_ops_row.addWidget(self.btn_export_db_backup)
 
+        self.btn_clear_demo = QPushButton("Reset / Clear Demo Data")
+        self.btn_clear_demo.clicked.connect(self.clear_demo_data)
+        db_ops_row.addWidget(self.btn_clear_demo)
+
         self.btn_purge_db = QPushButton("Purge Stored Data (Clear DB)")
         self.btn_purge_db.setObjectName("DangerButton")
         self.btn_purge_db.clicked.connect(self.purge_all_stored_data)
@@ -1736,15 +1740,15 @@ class MainWindow(QMainWindow):
         if parsed is None:
             return
 
-        # 2. Register attacker device in DB
+        # 2. Register attacker device in DB explicitly marked as [SIMULATED]
         attacker_dev = DeviceRecord(
             mac=parsed.src_mac,
             ip=attacker_ip,
-            hostname="rogue-mitm-host",
-            vendor="Randomized / Private MAC",
+            hostname="[SIMULATED] rogue-mitm-host",
+            vendor="[SIMULATED] Attacker (Demo)",
             is_online=True,
             is_trusted=False,
-            notes="Simulated MITM Attacker via Native C Engine",
+            notes="[SIMULATED] MITM Attacker via Native C Engine (Demo Data)",
         )
         self.db.upsert_device(attacker_dev)
 
@@ -1758,8 +1762,15 @@ class MainWindow(QMainWindow):
             is_gratuitous=parsed.is_gratuitous,
             eth_src_mac=parsed.eth_src_mac,
             mac_mismatch=parsed.mac_mismatch,
-            db=self.db,
+            db=None,
         )
+
+        if alert:
+            if not alert.alert_type.startswith("[SIMULATED]"):
+                alert.alert_type = f"[SIMULATED] {alert.alert_type}"
+            if not alert.description.startswith("[SIMULATED]"):
+                alert.description = f"[SIMULATED] {alert.description}"
+            alert.id = self.db.record_alert(alert)
 
         # 4. Update risk score to CRITICAL
         active_alerts = [alert] if alert else self.db.get_alerts(unresolved_only=True)
@@ -1770,7 +1781,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_all_views()
         self.status_bar.showMessage(
-            f"CRITICAL ALERT: Native C Engine parsed spoofed ARP reply from {parsed.src_mac} claiming Gateway {gw_ip}!"
+            f"[SIMULATED] CRITICAL ALERT: Native C Engine parsed spoofed ARP reply from {parsed.src_mac} claiming Gateway {gw_ip}!"
         )
 
     def refresh_all_views(self) -> None:
@@ -1912,13 +1923,20 @@ class MainWindow(QMainWindow):
 
             txt_v = QVBoxLayout()
             txt_v.setSpacing(2)
-            friendly_title = alert.alert_type.replace("_", " ").title()
-            if alert.alert_type == "ARP_SPOOFING":
+            clean_type = alert.alert_type
+            is_sim = "[SIMULATED]" in alert.description or "[SIMULATED]" in alert.alert_type
+            if is_sim and clean_type.startswith("[SIMULATED]"):
+                clean_type = clean_type.replace("[SIMULATED]", "").strip()
+
+            friendly_title = clean_type.replace("_", " ").title()
+            if clean_type == "ARP_SPOOFING":
                 friendly_title = f"ARP Spoofing / MITM from {alert.ip}"
-            elif alert.alert_type == "SUSPICIOUS_PORT":
+            elif clean_type == "SUSPICIOUS_PORT":
                 friendly_title = f"High-Risk Port Exposed on {alert.ip}"
-            elif alert.alert_type == "NEW_DEVICE":
+            elif clean_type == "NEW_DEVICE":
                 friendly_title = f"New Untrusted Host Detected ({alert.ip})"
+            if is_sim:
+                friendly_title = f"[SIMULATED] {friendly_title}"
 
             lbl_t = QLabel(friendly_title)
             lbl_t.setStyleSheet("color: #F8FAFC; font-weight: 700; font-size: 12px;")
@@ -2027,12 +2045,17 @@ class MainWindow(QMainWindow):
             conf_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             self.alerts_table.setItem(row_idx, 3, conf_item)
 
+            base_type = alert.alert_type
+            is_sim = "[SIMULATED]" in alert.description or "[SIMULATED]" in alert.alert_type
+            if is_sim and not base_type.startswith("[SIMULATED]"):
+                base_type = f"[SIMULATED] {base_type}"
+
             if alert.is_acknowledged:
-                type_text = f"{alert.alert_type} [APPROVED]"
+                type_text = f"{base_type} [APPROVED]"
             elif alert.is_resolved:
-                type_text = f"{alert.alert_type} [RESOLVED]"
+                type_text = f"{base_type} [RESOLVED]"
             else:
-                type_text = alert.alert_type
+                type_text = base_type
             self.alerts_table.setItem(row_idx, 4, QTableWidgetItem(type_text))
 
             self.alerts_table.setItem(row_idx, 5, QTableWidgetItem(alert.ip))
@@ -2120,6 +2143,16 @@ class MainWindow(QMainWindow):
                     f"The socket scanner subsystem is operating normally without external network packets.",
                 )
                 self.status_bar.showMessage("Localhost port test PASSED.")
+            elif res.get("sandbox_restricted"):
+                err_msg = res.get("message") or "Localhost sockets are restricted by environment policy (WSAEACCES 10013)."
+                QMessageBox.warning(
+                    self,
+                    "Localhost Verification Notice (Sandbox Restricted)",
+                    f"Notice: Local loopback socket binding is restricted in this environment:\n\n{err_msg}\n\n"
+                    f"Local Windows security or container policy blocked binding to 127.0.0.1. "
+                    f"In a standard unconstrained Windows desktop session, localhost verification operates normally.",
+                )
+                self.status_bar.showMessage("Localhost port test: RESTRICTED (WSAEACCES 10013).")
             else:
                 err_msg = res.get("message") or res.get("error") or "Unknown localhost test error"
                 QMessageBox.warning(
@@ -2171,6 +2204,23 @@ class MainWindow(QMainWindow):
             self.refresh_all_views()
             self.status_bar.showMessage("All stored database records have been purged.")
             QMessageBox.information(self, "Data Purged", "Database cleared successfully.")
+
+    def clear_demo_data(self) -> None:
+        """Clear all simulated or demo records (e.g., simulated rogue MITM host, test alerts)."""
+        reply = QMessageBox.question(
+            self,
+            "Clear Demo & Simulation Data",
+            "Are you sure you want to remove all simulated demo devices and alerts from the database?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            res = self.db.clear_demo_data()
+            self._recalculate_all_device_risks()
+            self.refresh_all_views()
+            msg = f"Cleared {res.get('devices', 0)} simulated device(s) and {res.get('security_alerts', 0)} simulated alert(s)."
+            self.status_bar.showMessage(msg)
+            QMessageBox.information(self, "Demo Data Cleared", f"✔ {msg}")
 
     def prune_history_records(self) -> None:
         """Prune historical timeline records older than the retention policy."""

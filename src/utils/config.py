@@ -88,7 +88,7 @@ class ConfigManager:
         if section == "database" and key == "path" and isinstance(val, (str, Path)):
             p = Path(val)
             if not p.is_absolute():
-                return str(resolve_data_path(p, seed_from_bundle=True))
+                return str(resolve_data_path(p, seed_from_bundle=False))
         if section == "logging" and key == "file" and isinstance(val, (str, Path)):
             p = Path(val)
             if not p.is_absolute():

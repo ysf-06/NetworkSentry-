@@ -105,6 +105,12 @@ def package_and_compute_checksums() -> int:
     # Create zip archive if dist/NetworkSentry directory exists
     app_folder = dist_dir / "NetworkSentry"
     if app_folder.exists() and app_folder.is_dir():
+        for stale in app_folder.glob("networksentry.db*"):
+            try:
+                stale.unlink()
+                print(f"[*] Cleaned leftover release database: {stale.name}")
+            except OSError:
+                pass
         zip_name = dist_dir / f"NetworkSentry-v{__version__}-windows-x64"
         print(f"[*] Creating release archive: {zip_name}.zip...")
         archive_path = Path(shutil.make_archive(str(zip_name), "zip", root_dir=dist_dir, base_dir="NetworkSentry"))

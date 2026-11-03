@@ -201,3 +201,63 @@ def test_db_schema_migrations_and_maintenance(tmp_path: Path) -> None:
     assert db.get_dashboard_stats()["total_devices"] == 0
 
 
+def test_clear_demo_data(tmp_path: Path) -> None:
+    """Verify that clear_demo_data removes simulated devices/alerts without touching real devices."""
+    db = DatabaseManager(db_path=tmp_path / "test_demo.db")
+
+    # Real device
+    real_dev = DeviceRecord(mac="11:22:33:44:55:66", ip="192.168.1.5", hostname="real-workstation", is_trusted=True)
+    db.upsert_device(real_dev)
+
+    # Simulated device & alert
+    sim_dev = DeviceRecord(
+        mac="DE:AD:BE:EF:CA:FE",
+        ip="192.168.1.250",
+        hostname="[SIMULATED] rogue-mitm-host",
+        vendor="[SIMULATED] Attacker",
+    )
+    db.upsert_device(sim_dev)
+
+    # Stale test IP device
+    test_ip_dev = DeviceRecord(
+        mac="99:88:77:66:55:44",
+        ip="192.168.1.10",
+        hostname="test-switch",
+        vendor="Cisco Systems",
+        notes="Legacy test lab device",
+    )
+    db.upsert_device(test_ip_dev)
+
+    sim_alert = SecurityAlertRecord(
+        alert_type="[SIMULATED] GATEWAY_MAC_TAMPER",
+        severity="CRITICAL",
+        mac="DE:AD:BE:EF:CA:FE",
+        ip="192.168.1.250",
+        description="[SIMULATED] Spoofed ARP reply",
+    )
+    db.record_alert(sim_alert)
+
+    # Alert for test IP that doesn't have [SIMULATED] in alert_type
+    test_ip_alert = SecurityAlertRecord(
+        alert_type="ARP_SPOOFING",
+        severity="WARNING",
+        mac="99:88:77:66:55:44",
+        ip="192.168.1.10",
+        description="Test IP ARP transition",
+    )
+    db.record_alert(test_ip_alert)
+
+    assert db.get_dashboard_stats()["total_devices"] == 3
+    assert len(db.get_alerts()) == 2
+
+    res = db.clear_demo_data()
+    assert res["devices"] == 2
+    assert res["security_alerts"] == 2
+
+    remaining_devs = db.get_all_devices()
+    assert len(remaining_devs) == 1
+    assert remaining_devs[0].mac == "11:22:33:44:55:66"
+    assert len(db.get_alerts()) == 0
+
+
+

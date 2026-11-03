@@ -57,7 +57,7 @@ def resolve_data_path(path: str | Path, seed_from_bundle: bool = False) -> Path:
     except OSError:
         pass
 
-    if seed_from_bundle and not target.exists():
+    if seed_from_bundle and not target.exists() and not p.name.endswith(".db"):
         candidates = []
         if getattr(sys, "frozen", False):
             candidates.append(Path(sys.executable).resolve().parent / p.name)

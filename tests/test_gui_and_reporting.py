@@ -145,7 +145,8 @@ def test_main_window_table_filtering_trust_and_arp_attack_simulation(tmp_path: P
     # Trigger Simulated ARP Spoofing Attack via Native C Engine
     win.simulate_arp_spoofing_attack()
     alerts = db.get_alerts(unresolved_only=True)
-    assert any(a.alert_type == "ARP_SPOOFING" and a.severity == "CRITICAL" for a in alerts)
+    assert any("ARP_SPOOFING" in a.alert_type and a.severity == "CRITICAL" for a in alerts)
+    assert any("[SIMULATED]" in a.alert_type and "[SIMULATED]" in a.description for a in alerts)
     attacker = db.get_device_by_mac("DE:AD:BE:EF:CA:FE")
     assert attacker is not None
     assert attacker.risk_level == "CRITICAL"

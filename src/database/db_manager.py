@@ -25,7 +25,7 @@ class DatabaseManager:
 
     def __init__(self, db_path: str | Path = "networksentry.db", wal_mode: bool = True) -> None:
         raw_path = Path(db_path)
-        self.db_path = raw_path if raw_path.is_absolute() else resolve_data_path(raw_path, seed_from_bundle=True)
+        self.db_path = raw_path if raw_path.is_absolute() else resolve_data_path(raw_path, seed_from_bundle=False)
         self.wal_mode = wal_mode
         self._lock = threading.RLock()
         self.initialize_schema()
@@ -779,6 +779,74 @@ class DatabaseManager:
                 "security_alerts": a_cnt,
                 "device_history": h_cnt,
                 "scan_sessions": s_cnt,
+            }
+
+    def clear_demo_data(self) -> Dict[str, int]:
+        """
+        Delete specifically simulated or demo records:
+        - Devices with [SIMULATED] in hostname/vendor/notes, rogue-mitm-host, or known test IPs.
+        - Security alerts with [SIMULATED] in alert_type/description or from test IPs.
+        - Associated port scans and device history.
+        """
+        demo_macs = set()
+        with self._lock:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT mac FROM devices
+                    WHERE hostname LIKE '%[SIMULATED]%'
+                       OR vendor LIKE '%[SIMULATED]%'
+                       OR notes LIKE '%[SIMULATED]%'
+                       OR hostname = 'rogue-mitm-host'
+                       OR mac = 'DE:AD:BE:EF:CA:FE'
+                       OR ip IN ('192.168.1.10', '192.168.1.11', '192.168.1.12', '192.168.1.250', '203.0.113.45')
+                    """
+                )
+                demo_macs = {row[0] for row in cur.fetchall()}
+
+                a_cnt = conn.execute(
+                    """
+                    DELETE FROM security_alerts
+                    WHERE alert_type LIKE '%[SIMULATED]%'
+                       OR description LIKE '%[SIMULATED]%'
+                       OR mac = 'DE:AD:BE:EF:CA:FE'
+                       OR ip IN ('192.168.1.10', '192.168.1.11', '192.168.1.12', '192.168.1.250', '203.0.113.45')
+                       OR mac IN (
+                           SELECT mac FROM devices
+                           WHERE hostname LIKE '%[SIMULATED]%'
+                              OR vendor LIKE '%[SIMULATED]%'
+                              OR notes LIKE '%[SIMULATED]%'
+                              OR hostname = 'rogue-mitm-host'
+                       )
+                    """
+                ).rowcount
+
+                p_cnt = 0
+                d_cnt = 0
+                h_cnt = 0
+                if demo_macs:
+                    placeholders = ",".join("?" for _ in demo_macs)
+                    mac_list = list(demo_macs)
+                    # Also clean any alerts associated with demo_macs that may have had custom text
+                    conn.execute(f"DELETE FROM security_alerts WHERE mac IN ({placeholders})", mac_list)
+                    p_cnt = conn.execute(
+                        f"DELETE FROM port_scans WHERE mac IN ({placeholders})",
+                        mac_list,
+                    ).rowcount
+                    d_cnt = conn.execute(
+                        f"DELETE FROM devices WHERE mac IN ({placeholders})",
+                        mac_list,
+                    ).rowcount
+                    h_cnt = conn.execute(
+                        f"DELETE FROM device_history WHERE mac IN ({placeholders})",
+                        mac_list,
+                    ).rowcount
+
+            return {
+                "devices": d_cnt,
+                "port_scans": p_cnt,
+                "security_alerts": a_cnt,
+                "device_history": h_cnt,
             }
 
     def prune_old_records(self, retention_days: int = 30) -> Dict[str, int]:

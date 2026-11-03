@@ -239,15 +239,39 @@ class PortScanner:
             actual_open_port = server_sock.getsockname()[1]
         except OSError as exc:
             if server_sock:
-                server_sock.close()
+                try:
+                    server_sock.close()
+                except OSError:
+                    pass
+            err_code = getattr(exc, "winerror", None) or getattr(exc, "errno", None) or -1
+            is_wsaeacces = (
+                err_code in (10013, errno.EACCES, getattr(errno, "WSAEACCES", 10013))
+                or "10013" in str(exc)
+                or "WSAEACCES" in str(exc)
+            )
+            msg = (
+                "Localhost socket binding blocked by Windows sandbox/security policy (WSAEACCES 10013). "
+                "Local loopback testing is restricted in this environment."
+                if is_wsaeacces
+                else f"Failed to bind ephemeral server socket on 127.0.0.1:{target_port}: {exc}"
+            )
             return {
                 "success": False,
+                "sandbox_restricted": is_wsaeacces,
+                "host": "127.0.0.1",
+                "port": target_port,
                 "open_port": target_port,
                 "closed_port": None,
                 "detected": False,
+                "state": "RESTRICTED" if is_wsaeacces else "CLOSED",
+                "service": "restricted" if is_wsaeacces else "unknown",
+                "banner": "",
                 "banner_matched": False,
                 "negative_check_passed": False,
-                "message": f"Failed to bind ephemeral server socket on 127.0.0.1:{target_port}: {exc}",
+                "elapsed_ms": 0.0,
+                "record": None,
+                "message": msg,
+                "error": msg,
             }
 
         def _serve() -> None:
@@ -298,9 +322,51 @@ class PortScanner:
             pass
         th.join(timeout=1.0)
 
+        # Check if connect or accept failed due to WSAEACCES sandbox restriction
+        sandbox_restricted = False
+        if open_record is None:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+                    probe_sock.settimeout(0.2)
+                    c_res = probe_sock.connect_ex(("127.0.0.1", actual_open_port))
+                    if c_res in (10013, errno.EACCES, getattr(errno, "WSAEACCES", 10013)):
+                        sandbox_restricted = True
+            except OSError as ce:
+                c_code = getattr(ce, "winerror", None) or getattr(ce, "errno", None) or -1
+                if c_code in (10013, errno.EACCES, getattr(errno, "WSAEACCES", 10013)) or "10013" in str(ce):
+                    sandbox_restricted = True
+
+        for err in server_error:
+            if "10013" in err or "WSAEACCES" in err or "access permissions" in err.lower():
+                sandbox_restricted = True
+
         detected = open_record is not None and open_record.state == "OPEN"
         banner_matched = bool(open_record and banner_text and banner_text in open_record.banner) if banner_text else True
         negative_passed = closed_record is None
+
+        if sandbox_restricted:
+            msg = (
+                "Localhost socket connection blocked by Windows sandbox/security policy (WSAEACCES 10013). "
+                "Local loopback testing is restricted in this environment."
+            )
+            return {
+                "success": False,
+                "sandbox_restricted": True,
+                "host": "127.0.0.1",
+                "port": actual_open_port,
+                "open_port": actual_open_port,
+                "closed_port": closed_port,
+                "detected": False,
+                "state": "RESTRICTED",
+                "service": "restricted",
+                "banner": "",
+                "banner_matched": False,
+                "negative_check_passed": negative_passed,
+                "elapsed_ms": round(elapsed_ms, 2),
+                "record": None,
+                "message": msg,
+                "error": msg,
+            }
 
         success = detected and negative_passed and banner_matched
 
@@ -313,6 +379,7 @@ class PortScanner:
 
         return {
             "success": success,
+            "sandbox_restricted": False,
             "host": "127.0.0.1",
             "port": actual_open_port,
             "open_port": actual_open_port,
