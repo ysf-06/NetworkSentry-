@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
+import platform
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Sequence
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,17 +77,255 @@ Version: {__version__}
     return notes_path
 
 
-def package_and_compute_checksums() -> int:
-    """Generate release checksums and package archive."""
+def find_signtool(explicit_path: str | Path | None = None) -> Optional[Path]:
+    """Locate signtool.exe via argument, SIGNTOOL_PATH, PATH, or Windows SDKs."""
+    if explicit_path:
+        p = Path(explicit_path)
+        if p.is_file():
+            return p
+
+    env_path = os.environ.get("SIGNTOOL_PATH")
+    if env_path:
+        p = Path(env_path)
+        if p.is_file():
+            return p
+
+    which_path = shutil.which("signtool.exe") or shutil.which("signtool")
+    if which_path:
+        return Path(which_path)
+
+    if platform.system().lower() == "windows":
+        sdk_roots = [
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits" / "10" / "bin",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Windows Kits" / "10" / "bin",
+        ]
+        for root in sdk_roots:
+            if root.exists():
+                matches = sorted(root.glob("*/x64/signtool.exe"), reverse=True)
+                if matches:
+                    return matches[0]
+
+        app_cert_roots = [
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / "Windows Kits"
+            / "10"
+            / "App Certification Kit"
+            / "signtool.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Windows Kits"
+            / "10"
+            / "App Certification Kit"
+            / "signtool.exe",
+        ]
+        for app_cert in app_cert_roots:
+            if app_cert.exists():
+                return app_cert
+
+    return None
+
+
+def sign_binary(
+    target: Path,
+    signtool: Path,
+    cert_path: Path,
+    cert_password: Optional[str] = None,
+    timestamp_url: Optional[str] = "http://timestamp.digicert.com",
+    description: Optional[str] = "Cyber Guardian (Network Sentry)",
+) -> bool:
+    """Sign a PE binary using Microsoft signtool.exe with SHA-256 Authenticode."""
+    if not target.exists():
+        return False
+
+    cmd = [
+        str(signtool),
+        "sign",
+        "/fd",
+        "SHA256",
+        "/f",
+        str(cert_path),
+    ]
+    if cert_password:
+        cmd.extend(["/p", cert_password])
+    if timestamp_url:
+        cmd.extend(["/tr", timestamp_url, "/td", "SHA256"])
+    if description:
+        cmd.extend(["/d", description])
+    cmd.append(str(target))
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            print(f"[+] Successfully signed: {target.name}")
+            return True
+        err = proc.stderr.strip() or proc.stdout.strip()
+        print(f"[!] Warning: Code signing failed for {target.name} (code {proc.returncode}): {err}")
+        return False
+    except Exception as e:
+        print(f"[!] Warning: Failed to invoke signtool for {target.name}: {e}")
+        return False
+
+
+def sign_release_artifacts(
+    dist_dir: Path,
+    cert_path: Optional[str | Path] = None,
+    cert_password: Optional[str] = None,
+    timestamp_url: Optional[str] = "http://timestamp.digicert.com",
+    signtool_path: Optional[str | Path] = None,
+    skip_sign: bool = False,
+) -> bool:
+    """Validate prerequisites and sign distribution binaries before archiving."""
+    if skip_sign:
+        print("[i] Windows Authenticode signing: Skipped via --skip-sign flag.")
+        return True
+
+    if platform.system().lower() != "windows":
+        print(f"[i] Windows Authenticode signing: Skipped on non-Windows platform ({platform.system()}).")
+        return True
+
+    if not cert_path:
+        print(
+            "[i] Windows Authenticode signing: No code-signing certificate provided via --cert "
+            "or CODE_SIGN_CERT_PATH. Continuing build without signing."
+        )
+        return True
+
+    cert = Path(cert_path)
+    if not cert.exists():
+        print(f"[!] Warning: Code-signing certificate file not found at '{cert}'. Continuing build without signing.")
+        return True
+
+    signtool = find_signtool(signtool_path)
+    if not signtool:
+        print("[!] Warning: Microsoft signtool.exe not found on PATH or in Windows SDK. Continuing build without signing.")
+        return True
+
+    candidates = [
+        dist_dir / "NetworkSentry" / "NetworkSentry.exe",
+        PROJECT_ROOT / "src" / "native" / "packet_parser.dll",
+        dist_dir / "NetworkSentry" / "_internal" / "src" / "native" / "packet_parser.dll",
+        dist_dir / "NetworkSentry" / "src" / "native" / "packet_parser.dll",
+    ]
+    seen: set[Path] = set()
+    to_sign: list[Path] = []
+    for c in candidates:
+        if c.exists():
+            resolved = c.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                to_sign.append(c)
+
+    if not to_sign:
+        print("[*] No binary targets found to sign.")
+        return True
+
+    print(f"[*] Signing {len(to_sign)} binary artifacts with signtool ({signtool.name})...")
+    success = True
+    for target in to_sign:
+        ok = sign_binary(
+            target=target,
+            signtool=signtool,
+            cert_path=cert,
+            cert_password=cert_password,
+            timestamp_url=timestamp_url,
+        )
+        if not ok:
+            success = False
+
+    return success
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse packaging command line options and environment variable fallbacks."""
+    parser = argparse.ArgumentParser(description="Package Network Sentry and sign release artifacts.")
+    parser.add_argument(
+        "--cert",
+        "--cert-path",
+        dest="cert_path",
+        default=os.environ.get("CODE_SIGN_CERT_PATH"),
+        help="Path to code signing PFX/P12 certificate file (or CODE_SIGN_CERT_PATH env var).",
+    )
+    parser.add_argument(
+        "--password",
+        "--cert-password",
+        dest="cert_password",
+        default=os.environ.get("CODE_SIGN_CERT_PASSWORD"),
+        help="Password for code signing certificate (or CODE_SIGN_CERT_PASSWORD env var).",
+    )
+    parser.add_argument(
+        "--timestamp-url",
+        dest="timestamp_url",
+        default=os.environ.get("CODE_SIGN_TIMESTAMP_URL", "http://timestamp.digicert.com"),
+        help="RFC 3161 timestamp server URL (default: http://timestamp.digicert.com).",
+    )
+    parser.add_argument(
+        "--signtool",
+        dest="signtool_path",
+        default=os.environ.get("SIGNTOOL_PATH"),
+        help="Explicit path to signtool.exe (or SIGNTOOL_PATH env var).",
+    )
+    parser.add_argument(
+        "--skip-sign",
+        dest="skip_sign",
+        action="store_true",
+        default=False,
+        help="Explicitly skip Authenticode code signing.",
+    )
+    return parser.parse_args(argv)
+
+
+def package_and_compute_checksums(
+    argv: Sequence[str] | None = None,
+    dist_dir: Optional[Path] = None,
+    cert_path: Optional[str | Path] = None,
+    cert_password: Optional[str] = None,
+    timestamp_url: Optional[str] = None,
+    signtool_path: Optional[str | Path] = None,
+    skip_sign: Optional[bool] = None,
+) -> int:
+    """Generate release notes, clean build artifacts, sign binaries, archive, and compute checksums."""
     print(f"[*] Packaging Cyber Guardian v{__version__}...")
-    dist_dir = PROJECT_ROOT / "dist"
+    if dist_dir is None:
+        dist_dir = PROJECT_ROOT / "dist"
     dist_dir.mkdir(parents=True, exist_ok=True)
+
+    args = parse_args(argv if argv is not None else [])
+    effective_cert = cert_path if cert_path is not None else args.cert_path
+    effective_password = cert_password if cert_password is not None else args.cert_password
+    effective_ts = timestamp_url if timestamp_url is not None else args.timestamp_url
+    effective_signtool = signtool_path if signtool_path is not None else args.signtool_path
+    effective_skip_sign = skip_sign if skip_sign is not None else args.skip_sign
 
     # 1. Generate release notes
     notes_file = generate_release_notes(dist_dir)
     print(f"[+] Release notes written to: {notes_file}")
 
-    # 2. Collect critical binaries and files for checksum verification
+    # 2. Clean leftover runtime files from previous test/dev runs in dist
+    app_folder = dist_dir / "NetworkSentry"
+    if app_folder.exists() and app_folder.is_dir():
+        for stale in app_folder.glob("networksentry.db*"):
+            try:
+                stale.unlink()
+                print(f"[*] Cleaned leftover release database: {stale.name}")
+            except OSError:
+                pass
+        for stale_log in app_folder.glob("*.log"):
+            try:
+                stale_log.unlink()
+                print(f"[*] Cleaned leftover release log: {stale_log.name}")
+            except OSError:
+                pass
+
+    # 3. Authenticode Code Signing (executed BEFORE archiving and hashing)
+    sign_release_artifacts(
+        dist_dir=dist_dir,
+        cert_path=effective_cert,
+        cert_password=effective_password,
+        timestamp_url=effective_ts,
+        signtool_path=effective_signtool,
+        skip_sign=effective_skip_sign,
+    )
+
+    # 4. Collect critical binaries and files for checksum verification
     targets_to_hash: list[Path] = []
 
     c_dll = PROJECT_ROOT / "src" / "native" / "packet_parser.dll"
@@ -102,22 +344,15 @@ def package_and_compute_checksums() -> int:
     if app_exe.exists():
         targets_to_hash.append(app_exe)
 
-    # Create zip archive if dist/NetworkSentry directory exists
-    app_folder = dist_dir / "NetworkSentry"
+    # 5. Create zip archive if dist/NetworkSentry directory exists
     if app_folder.exists() and app_folder.is_dir():
-        for stale in app_folder.glob("networksentry.db*"):
-            try:
-                stale.unlink()
-                print(f"[*] Cleaned leftover release database: {stale.name}")
-            except OSError:
-                pass
         zip_name = dist_dir / f"NetworkSentry-v{__version__}-windows-x64"
         print(f"[*] Creating release archive: {zip_name}.zip...")
         archive_path = Path(shutil.make_archive(str(zip_name), "zip", root_dir=dist_dir, base_dir="NetworkSentry"))
         targets_to_hash.append(archive_path)
         print(f"[+] Archive created: {archive_path}")
 
-    # 3. Write release_checksums.txt
+    # 6. Write release_checksums.txt
     checksums_file = dist_dir / "release_checksums.txt"
     lines = [
         f"# Cyber Guardian (Network Sentry) v{__version__} SHA-256 Checksums",
@@ -134,18 +369,15 @@ def package_and_compute_checksums() -> int:
     checksums_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[+] Checksums saved to: {checksums_file}")
 
-    # 4. Code signing notice
-    signtool = shutil.which("signtool.exe")
-    pfx_cert = os.environ.get("CODE_SIGN_CERT_PATH")
-    if signtool and pfx_cert and Path(pfx_cert).exists():
-        print("[*] Performing Authenticode code signing with signtool...")
-        # Production signing command would execute here if certificate is provisioned
-    else:
-        print("[i] Windows Authenticode signing: No code-signing PFX certificate provided in environment.")
-        print("    Self-signed or release certificate can be attached using: signtool sign /f <cert.pfx> /p <password> ...")
-
     return 0
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point."""
+    if argv is None:
+        argv = sys.argv[1:]
+    return package_and_compute_checksums(argv=argv)
+
+
 if __name__ == "__main__":
-    sys.exit(package_and_compute_checksums())
+    sys.exit(main())

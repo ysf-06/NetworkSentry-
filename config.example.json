@@ -31,7 +31,8 @@
     "alert_on_new_device": true,
     "auto_port_scan_new_devices": false,
     "authorized_network_consent": false,
-    "authorized_network_consent_timestamp": null
+    "authorized_network_consent_timestamp": null,
+    "enable_passive_capture": false
   },
   "logging": {
     "level": "INFO",

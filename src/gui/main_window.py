@@ -182,12 +182,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = config or ConfigManager("config.json")
         db_path = self.cfg.get("database", "path", "networksentry.db")
-        wal_mode = bool(self.cfg.get("database", "wal_mode", True))
+        wal_mode = self.cfg.get_bool("database", "wal_mode", True)
         self.db = db or DatabaseManager(db_path=db_path, wal_mode=wal_mode)
 
         self.arp_scanner = ARPScanner()
         self.spoof_detector = ARPSpoofDetector(
-            lock_gateway_mac=bool(self.cfg.get("security", "lock_gateway_mac", True))
+            lock_gateway_mac=self.cfg.get_bool("security", "lock_gateway_mac", True)
         )
         self.port_scanner = PortScanner(timeout=0.35, max_workers=24, grab_banners=True)
         self.risk_engine = RiskEngine()
@@ -213,6 +213,7 @@ class MainWindow(QMainWindow):
         self._side_buttons: List[QPushButton] = []
         self._telemetry_charts: List[TelemetryAreaChart] = []
         self.timeline_slider: TimelineScrubberSlider
+        self.chk_passive_capture: QCheckBox
 
         self.setWindowTitle("CYBER GUARDIAN | Network Port Scanner & Packet Analyzer")
         self.setWindowIcon(create_cyber_guardian_icon(64))
@@ -222,7 +223,11 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_tray_icon()
         self._setup_timers()
-        if self.active_interface:
+        if (
+            self.cfg.get_bool("security", "authorized_network_consent", False)
+            and self.cfg.get_bool("security", "enable_passive_capture", False)
+            and self.active_interface
+        ):
             self.traffic_monitor.start_live_pcap(
                 interface_name=self.active_interface.name,
                 interface_ip=self.active_interface.ip_address,
@@ -422,16 +427,9 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Ready. Click 'Start Scan' to discover active devices and analyze ports.")
 
         # Check for first-run authorization consent (deferred timer for interactive users)
-        if not bool(self.cfg.get("security", "authorized_network_consent", False)):
+        if not self.cfg.get_bool("security", "authorized_network_consent", False):
             if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
                 QTimer.singleShot(250, self._show_consent_dialog)
-
-        # Start live passive wire capture on active interface if available
-        if self.active_interface:
-            self.traffic_monitor.start_live_pcap(
-                interface_name=self.active_interface.name,
-                interface_ip=self.active_interface.ip_address,
-            )
 
     def switch_page(self, index: int) -> None:
 
@@ -628,9 +626,9 @@ class MainWindow(QMainWindow):
         cpr_lay.setContentsMargins(14, 12, 14, 10)
         cpr_lay.setSpacing(4)
         cpr_hdr = QHBoxLayout()
-        lbl_cpr = QLabel("Top Protocols")
-        lbl_cpr.setObjectName("CardHeaderTitle")
-        cpr_hdr.addWidget(lbl_cpr)
+        self.lbl_top_protocols_title = QLabel("Top Protocols (Estimated — Local OS Sockets)")
+        self.lbl_top_protocols_title.setObjectName("CardHeaderTitle")
+        cpr_hdr.addWidget(self.lbl_top_protocols_title)
         cpr_hdr.addStretch()
         lbl_dots2 = QLabel("•••")
         lbl_dots2.setStyleSheet("color: #64748B; font-weight: bold;")
@@ -1179,7 +1177,7 @@ class MainWindow(QMainWindow):
         proto_frame.setObjectName("TelemetryPanel")
         pf_lay = QVBoxLayout(proto_frame)
         pf_lay.setContentsMargins(4, 4, 4, 4)
-        self.proto_breakdown_bar = HorizontalBreakdownBarWidget("Protocol Breakdown")
+        self.proto_breakdown_bar = HorizontalBreakdownBarWidget("Protocol Breakdown (Estimated — Local OS Sockets)")
         pf_lay.addWidget(self.proto_breakdown_bar)
         mid_break.addWidget(proto_frame, stretch=1)
 
@@ -1187,7 +1185,7 @@ class MainWindow(QMainWindow):
         port_frame.setObjectName("TelemetryPanel")
         ptf_lay = QVBoxLayout(port_frame)
         ptf_lay.setContentsMargins(4, 4, 4, 4)
-        self.port_breakdown_bar = HorizontalBreakdownBarWidget("Port Breakdown")
+        self.port_breakdown_bar = HorizontalBreakdownBarWidget("Port Breakdown (Estimated — Local OS Sockets)")
         ptf_lay.addWidget(self.port_breakdown_bar)
         mid_break.addWidget(port_frame, stretch=1)
 
@@ -1319,6 +1317,20 @@ class MainWindow(QMainWindow):
         auto_row.addWidget(self.spin_interval)
         auto_row.addStretch()
         form.addRow("Auto-Scan Schedule:", auto_row)
+
+        passive_row = QHBoxLayout()
+        self.chk_passive_capture = QCheckBox("Pasif Yakalamayı Etkinleştir")
+        self.chk_passive_capture.setToolTip(
+            "Npcap ile ağ bağdaştırıcısından gerçek zamanlı pasif paket yakalamayı etkinleştirir. "
+            "Açık rıza ve yetkilendirme onayı gerektirir."
+        )
+        is_passive_enabled = self.cfg.get_bool("security", "enable_passive_capture", False)
+        has_consent = self.cfg.get_bool("security", "authorized_network_consent", False)
+        self.chk_passive_capture.setChecked(is_passive_enabled and has_consent)
+        self.chk_passive_capture.toggled.connect(self._on_passive_capture_toggled)
+        passive_row.addWidget(self.chk_passive_capture)
+        passive_row.addStretch()
+        form.addRow("Pasif Paket Yakalama:", passive_row)
 
         form.addRow(
             "Native C Packet Engine:",
@@ -1543,9 +1555,27 @@ class MainWindow(QMainWindow):
             )
 
         self.flows_spiral.set_intensities(snap.spiral_intensities)
+        self._apply_breakdown_titles(snap.telemetry_mode, snap.is_estimated)
         self.proto_breakdown_bar.set_segments(snap.protocol_breakdown)
         self.port_breakdown_bar.set_segments(snap.port_breakdown)
         self.tcp_flag_widget.set_samples(snap.samples)
+
+    @staticmethod
+    def breakdown_suffix(telemetry_mode: str, is_estimated: bool) -> str:
+        """Return the disclosure suffix for protocol/port/flag charts."""
+        if "DEMO" in (telemetry_mode or "").upper():
+            return " (Demo / Simulated)"
+        if is_estimated:
+            return " (Estimated — Local OS Sockets)"
+        return " (Live Packet Capture)"
+
+    def _apply_breakdown_titles(self, telemetry_mode: str, is_estimated: bool) -> None:
+        """Label distribution charts so estimated data is never mistaken for real capture."""
+        suffix = self.breakdown_suffix(telemetry_mode, is_estimated)
+        self.lbl_top_protocols_title.setText(f"Top Protocols{suffix}")
+        self.proto_breakdown_bar.set_title(f"Protocol Breakdown{suffix}")
+        self.port_breakdown_bar.set_title(f"Port Breakdown{suffix}")
+        self.tcp_flag_widget.set_title(f"TCP Flag Distribution{suffix}")
 
     # =========================================================================
     # SCANNING, SPOOFING SIMULATION & VIEW REFRESH
@@ -1554,10 +1584,15 @@ class MainWindow(QMainWindow):
         if 0 <= index < len(self.interfaces):
             self.active_interface = self.interfaces[index]
             self.spoof_detector.reset_baseline()
-            self.traffic_monitor.start_live_pcap(
-                interface_name=self.active_interface.name,
-                interface_ip=self.active_interface.ip_address,
-            )
+            self.traffic_monitor.stop_live_pcap()
+            if (
+                self.cfg.get_bool("security", "authorized_network_consent", False)
+                and self.cfg.get_bool("security", "enable_passive_capture", False)
+            ):
+                self.traffic_monitor.start_live_pcap(
+                    interface_name=self.active_interface.name,
+                    interface_ip=self.active_interface.ip_address,
+                )
             self.status_bar.showMessage(
                 f"Switched active interface to {self.active_interface.name} ({self.active_interface.cidr})"
             )
@@ -1575,6 +1610,34 @@ class MainWindow(QMainWindow):
     def _on_interval_changed(self, seconds: int) -> None:
         if self.chk_auto_scan.isChecked():
             self.scan_timer.setInterval(seconds * 1000)
+
+    def _on_passive_capture_toggled(self, checked: bool) -> None:
+        """Handle user toggle for live passive wire capture."""
+        if checked:
+            if not self.cfg.get_bool("security", "authorized_network_consent", False):
+                consent_granted = self._show_consent_dialog()
+                if not consent_granted:
+                    self.chk_passive_capture.blockSignals(True)
+                    self.chk_passive_capture.setChecked(False)
+                    self.chk_passive_capture.blockSignals(False)
+                    self.status_bar.showMessage("Pasif yakalama iptal edildi: Yetki onayı verilmedi.")
+                    return
+            self.cfg.set("security", "enable_passive_capture", True)
+            self.cfg.save()
+            if self.active_interface:
+                started = self.traffic_monitor.start_live_pcap(
+                    interface_name=self.active_interface.name,
+                    interface_ip=self.active_interface.ip_address,
+                )
+                if started:
+                    self.status_bar.showMessage(f"Pasif paket yakalama etkinleştirildi: {self.active_interface.name}")
+                else:
+                    self.status_bar.showMessage("Pasif paket yakalama başlatılamadı (Npcap sürücüsü tespit edilemedi).")
+        else:
+            self.cfg.set("security", "enable_passive_capture", False)
+            self.cfg.save()
+            self.traffic_monitor.stop_live_pcap()
+            self.status_bar.showMessage("Pasif paket yakalama devre dışı bırakıldı.")
 
     def _show_consent_dialog(self) -> bool:
         """Display an explicit authorization confirmation modal before scanning any network."""
@@ -1618,8 +1681,22 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted and chk_consent.isChecked():
             self.cfg.set("security", "authorized_network_consent", True)
             self.cfg.save()
+            if (
+                self.cfg.get_bool("security", "enable_passive_capture", False)
+                and self.active_interface
+            ):
+                self.traffic_monitor.start_live_pcap(
+                    interface_name=self.active_interface.name,
+                    interface_ip=self.active_interface.ip_address,
+                )
             return True
-        return False
+        else:
+            if hasattr(self, "chk_passive_capture"):
+                self.chk_passive_capture.blockSignals(True)
+                self.chk_passive_capture.setChecked(False)
+                self.chk_passive_capture.blockSignals(False)
+            self.traffic_monitor.stop_live_pcap()
+            return False
 
     def start_network_scan(self) -> None:
         """Launch an asynchronous ARP & Security scan on the active network interface."""
@@ -1629,7 +1706,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("No active IPv4 network interface available.")
             return
 
-        if not bool(self.cfg.get("security", "authorized_network_consent", False)):
+        if not self.cfg.get_bool("security", "authorized_network_consent", False):
             if not self._show_consent_dialog():
                 self.status_bar.showMessage("Scan cancelled: Authorization consent was not granted.")
                 return
@@ -1665,8 +1742,8 @@ class MainWindow(QMainWindow):
             spoof_detector=self.spoof_detector,
             port_scanner=self.port_scanner,
             risk_engine=self.risk_engine,
-            alert_on_new_device=bool(self.cfg.get("security", "alert_on_new_device", True)),
-            auto_port_scan_new=bool(self.cfg.get("security", "auto_port_scan_new_devices", False)),
+            alert_on_new_device=self.cfg.get_bool("security", "alert_on_new_device", True),
+            auto_port_scan_new=self.cfg.get_bool("security", "auto_port_scan_new_devices", False),
             common_ports=custom_ports,
             override_cidr=override_cidr,
             custom_workers=custom_workers,

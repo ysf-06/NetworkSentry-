@@ -146,24 +146,28 @@ def run_cli_scan(
     config_path: str = "config.json",
     export_csv: Optional[str] = None,
     export_json: Optional[str] = None,
+    consent_granted: bool = False,
 ) -> int:
     """Execute a full CLI network discovery & security scan."""
     _prepare_working_directory(config_path)
     cfg = ConfigManager(config_path)
     setup_logger("NetworkSentry", log_file=cfg.get("logging", "file", "networksentry.log"))
+
+    consent = consent_granted or cfg.get_bool("security", "authorized_network_consent", False)
+    if not consent:
+        print("\n[!] NOTICE: Authorized Networks Only")
+        print("    You must only scan networks and devices you own or have explicit authorization to assess.")
+        print("    Set 'authorized_network_consent': true in config.json or pass --yes to confirm authorization.\n")
+        return 1
+
     db = DatabaseManager(
         db_path=cfg.get("database", "path", "networksentry.db"),
-        wal_mode=bool(cfg.get("database", "wal_mode", True)),
+        wal_mode=cfg.get_bool("database", "wal_mode", True),
     )
     active = InterfaceDetector.get_active_interface(cfg.get("network", "preferred_interface"))
     if not active:
         print("[Error] No active IPv4 network interface detected.")
         return 1
-
-    if not bool(cfg.get("security", "authorized_network_consent", False)):
-        print("\n[!] NOTICE: Authorized Networks Only")
-        print("    You must only scan networks and devices you own or have explicit authorization to assess.")
-        print("    Set 'authorized_network_consent': true in config.json to confirm authorization.\n")
 
     print(f"[*] Scanning subnet {active.cidr} on interface '{active.name}' (GW: {active.gateway_ip})...")
     max_workers = int(cfg.get("network", "max_workers", 24))
@@ -171,14 +175,14 @@ def run_cli_scan(
     delay_ms = 1000.0 / float(rate_limit_pps) if rate_limit_pps > 0 else 0.0
 
     scanner = ARPScanner(max_workers=max_workers, rate_limit_delay_ms=delay_ms)
-    spoof_detector = ARPSpoofDetector(lock_gateway_mac=bool(cfg.get("security", "lock_gateway_mac", True)))
+    spoof_detector = ARPSpoofDetector(lock_gateway_mac=cfg.get_bool("security", "lock_gateway_mac", True))
     port_scanner = PortScanner(timeout=0.35, max_workers=max_workers, rate_limit_delay_ms=delay_ms)
     risk_engine = RiskEngine()
 
     result = scanner.scan_and_sync(
         interface=active,
         db=db,
-        alert_on_new_device=bool(cfg.get("security", "alert_on_new_device", True)),
+        alert_on_new_device=cfg.get_bool("security", "alert_on_new_device", True),
     )
     spoof_detector.analyze_scan(
         ip_to_macs=result.ip_to_macs,
@@ -236,6 +240,7 @@ def run_gui(config_path: str = "config.json") -> int:
     setup_logger("NetworkSentry", log_file=cfg.get("logging", "file", "networksentry.log"))
 
     app = QApplication.instance() or QApplication(sys.argv)
+    assert isinstance(app, QApplication)
     app.setApplicationName("Cyber Guardian — Network Sentry")
     app.setOrganizationName("CyberGuardian")
     app.setWindowIcon(create_cyber_guardian_icon(64))
@@ -302,6 +307,12 @@ def main() -> None:
         default=None,
         help="Export full security audit report to JSON path (used with --scan)",
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Confirm authorization consent for network scanning via CLI",
+    )
     args = parser.parse_args()
 
     if args.reset_db:
@@ -350,12 +361,13 @@ def main() -> None:
         print("  Target IP              : 127.0.0.1")
         print(f"  Ephemeral Open Port    : {res['open_port']} (Detected: {res['detected']}, Elapsed: {res.get('elapsed_ms', 0)} ms)")
         print(f"  Ephemeral Closed Port  : {res['closed_port']} (Negative Check: {res['negative_check_passed']})")
-        if res.get("record"):
-            print(f"  Banner Grabbed         : '{res['record'].banner}'")
+        rec = res.get("record")
+        if rec is not None and hasattr(rec, "banner"):
+            print(f"  Banner Grabbed         : '{getattr(rec, 'banner')}'")
         if res.get("sandbox_restricted"):
-            print(f"  Sandbox Restriction    : WSAEACCES 10013 (OS/Sandbox policy restricts local loopback socket binding)")
+            print("  Sandbox Restriction    : WSAEACCES 10013 (OS/Sandbox policy restricts local loopback socket binding)")
             print(f"  Diagnostic Context     : {res.get('message')}")
-            print(f"  Verification Result    : RESTRICTED (Sandbox Policy)")
+            print("  Verification Result    : RESTRICTED (Sandbox Policy)")
             print("=" * 74)
             sys.exit(0)
         print(f"  Verification Result    : {'PASSED' if res['success'] else 'FAILED'}")
@@ -373,6 +385,7 @@ def main() -> None:
                 config_path=args.config,
                 export_csv=args.export_csv,
                 export_json=args.export_json,
+                consent_granted=args.yes,
             )
         )
     sys.exit(run_gui(config_path=args.config))

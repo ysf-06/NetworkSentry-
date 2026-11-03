@@ -1063,6 +1063,12 @@ class HorizontalBreakdownBarWidget(QWidget):
         self._segments: List[Tuple[str, float, str]] = []
         self.setMinimumSize(280, 96)
 
+    def set_title(self, title: str) -> None:
+        """Update the panel title (e.g. to disclose estimated telemetry)."""
+        if title != self.title:
+            self.title = title
+            self.update()
+
     def set_segments(self, segments: Sequence[Tuple[str, float, str]]) -> None:
         self._segments = list(segments)
         self.update()
@@ -1151,7 +1157,14 @@ class TcpFlagDistributionWidget(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._samples: List[TrafficSample] = []
+        self.title = "TCP Flag Distribution"
         self.setMinimumSize(600, 185)
+
+    def set_title(self, title: str) -> None:
+        """Update the panel title (e.g. to disclose estimated telemetry)."""
+        if title != self.title:
+            self.title = title
+            self.update()
 
     def set_samples(self, samples: Sequence[TrafficSample]) -> None:
         self._samples = list(samples)[-48:]
@@ -1187,9 +1200,9 @@ class TcpFlagDistributionWidget(QWidget):
         painter.setPen(QColor("#F1F5F9"))
         painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         painter.drawText(
-            QRectF(26.0, 3.0, 260.0, 16.0),
+            QRectF(26.0, 3.0, max(260.0, w - 40.0), 16.0),
             Qt.AlignmentFlag.AlignLeft,
-            "TCP Flag Distribution",
+            self.title,
         )
 
         # Log Y-axis grid & labels

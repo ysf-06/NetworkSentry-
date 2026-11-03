@@ -6,7 +6,7 @@ echo ======================================================================
 echo   Cyber Guardian (Network Sentry) -- Windows Desktop Release Builder
 echo ======================================================================
 
-echo [1/4] Compiling Native C Packet Engine (packet_parser.dll)...
+echo [1/5] Compiling Native C Packet Engine (packet_parser.dll)...
 pushd src\native
 call build.bat
 if %ERRORLEVEL% NEQ 0 (
@@ -16,7 +16,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 popd
 
-echo [2/4] Running Pytest Verification Suite...
+echo [2/5] Running Pytest Verification Suite...
 .\.venv\Scripts\python.exe -m pytest -q
 if %ERRORLEVEL% NEQ 0 (
     echo [Error] Unit test suite failed. Aborting release build.
@@ -25,7 +25,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo [3/5] Packaging Standalone Windows Desktop App with PyInstaller...
 if exist "dist\NetworkSentry\networksentry.db*" del /f /q "dist\NetworkSentry\networksentry.db*" 2>nul
-if exist "networksentry.db*" del /f /q "networksentry.db*" 2>nul
+if exist "dist\NetworkSentry\*.log" del /f /q "dist\NetworkSentry\*.log" 2>nul
 .\.venv\Scripts\pyinstaller.exe ^
     --noconfirm ^
     --clean ^
@@ -50,7 +50,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [4/5] Generating SHA-256 Checksums and Release Archive...
-.\.venv\Scripts\python.exe scripts\package_release.py
+.\.venv\Scripts\python.exe scripts\package_release.py %*
 if %ERRORLEVEL% NEQ 0 (
     echo [Error] Release checksum generation failed.
     exit /b 1

@@ -27,6 +27,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_port_scan_new_devices": False,
         "authorized_network_consent": False,
         "authorized_network_consent_timestamp": None,
+        "enable_passive_capture": False,
     },
     "logging": {
         "level": "INFO",
@@ -34,6 +35,37 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
 }
 
+
+
+def to_bool(val: Any, default: bool = False) -> bool:
+    """Safely coerce various representations (bool, int, str) to a strict boolean.
+
+    Recognizes standard truthy strings ('true', '1', 'yes', 'y', 't', 'on', 'enable', 'enabled')
+    and falsy strings ('false', '0', 'no', 'n', 'f', 'off', 'disable', 'disabled', '').
+    Defaults to `default` (typically False) for unrecognized strings or non-boolean types.
+    """
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        normalized = val.strip().lower()
+        if normalized in ("true", "1", "yes", "y", "t", "on", "enable", "enabled"):
+            return True
+        if normalized in ("false", "0", "no", "n", "f", "off", "disable", "disabled", ""):
+            return False
+        return default
+    return default
+
+
+coerce_bool = to_bool
+
+
+def is_consent_granted(cfg: "ConfigManager") -> bool:
+    """Check whether authorized network consent has been explicitly granted in configuration."""
+    return cfg.has_authorized_consent()
 
 
 class ConfigManager:
@@ -54,7 +86,11 @@ class ConfigManager:
                 user_cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
                 for section, values in user_cfg.items():
                     if isinstance(values, dict) and section in merged:
-                        merged[section].update(values)
+                        for k, v in values.items():
+                            if k in merged[section] and isinstance(DEFAULT_CONFIG[section].get(k), bool):
+                                merged[section][k] = to_bool(v, default=DEFAULT_CONFIG[section][k])
+                            else:
+                                merged[section][k] = v
                     else:
                         merged[section] = values
             except (json.JSONDecodeError, OSError):
@@ -95,10 +131,30 @@ class ConfigManager:
                 return str(resolve_data_path(p, seed_from_bundle=False))
         return val
 
+    def get_bool(self, section: str, key: str, default: bool = False) -> bool:
+        """Retrieve a specific setting coerced to a strict boolean value."""
+        val = self.get(section, key, default)
+        return to_bool(val, default=default)
+
+    def has_authorized_consent(self) -> bool:
+        """Return whether user has granted authorization consent for network scanning."""
+        return self.get_bool("security", "authorized_network_consent", False)
+
+    def is_passive_capture_enabled(self) -> bool:
+        """Return whether passive packet capture is enabled in configuration."""
+        return self.get_bool("security", "enable_passive_capture", False)
+
     def set(self, section: str, key: str, value: Any) -> None:
-        """Set a configuration value under section and key."""
+        """Set a configuration value under section and key, normalizing boolean schema keys."""
         if section not in self.data or not isinstance(self.data[section], dict):
             self.data[section] = {}
-        self.data[section][key] = value
+        if (
+            section in DEFAULT_CONFIG
+            and key in DEFAULT_CONFIG[section]
+            and isinstance(DEFAULT_CONFIG[section][key], bool)
+        ):
+            self.data[section][key] = to_bool(value, default=DEFAULT_CONFIG[section][key])
+        else:
+            self.data[section][key] = value
 
 
